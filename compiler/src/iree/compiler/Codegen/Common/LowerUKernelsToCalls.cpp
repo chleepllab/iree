@@ -27,6 +27,7 @@ struct LowerUKernelOpsToCallsPass
 } // namespace
 
 void LowerUKernelOpsToCallsPass::runOnOperation() {
+  llvm::outs()<<"LowerUKernelOpsToCallsPass::runOnOperation()\n";
   MLIRContext *context = &getContext();
   RewritePatternSet patterns(context);
   llvm::MapVector<IREE::Codegen::UKernelOpInterface, mlir::CallOpInterface>
@@ -35,11 +36,13 @@ void LowerUKernelOpsToCallsPass::runOnOperation() {
   IRRewriter rewriter(context);
   WalkResult result = getOperation().walk(
       [&](IREE::Codegen::UKernelOpInterface microKernelOp) -> WalkResult {
+        llvm::outs()<<"calling microKernekOp.lowerToFunctionCall()\n";
         OpBuilder::InsertionGuard g(rewriter);
         rewriter.setInsertionPoint(microKernelOp);
         FailureOr<mlir::CallOpInterface> callOp =
             microKernelOp.lowerToFunctionCall(rewriter);
         if (failed(callOp)) {
+          llvm::outs()<<"failed(callOp)\n";
           errorOp = microKernelOp;
           return WalkResult::interrupt();
         }
@@ -47,11 +50,13 @@ void LowerUKernelOpsToCallsPass::runOnOperation() {
         return WalkResult::advance();
       });
   if (result.wasInterrupted()) {
+    llvm::outs()<<"failed to lower micro kernel operation to function call\n";
     errorOp->emitOpError(
         "failed to lower micro kernel operation to function call");
     return signalPassFailure();
   }
   for (auto r : toReplace) {
+    llvm::outs()<<"rewriter.replaceOp\n";
     rewriter.replaceOp(r.first, r.second->getResults());
   }
 }

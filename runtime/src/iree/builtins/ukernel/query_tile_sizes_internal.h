@@ -29,4 +29,14 @@ bool iree_uk_query_matmul_tile_sizes_arch(
     const iree_uk_query_tile_sizes_2d_params_t* params,
     iree_uk_matmul_tile_sizes_t* out_matmul_tile_sizes);
 
+// Holds conv tile params as returned from architecture-specific backend code.
+typedef struct iree_uk_conv_tile_sizes_t {
+  int M, K, N;
+} iree_uk_conv_tile_sizes_t;
+
+// Architecture-specific implementation.
+bool iree_uk_query_conv_tile_sizes_arch(
+    const iree_uk_query_tile_sizes_2d_params_t* params,
+    iree_uk_conv_tile_sizes_t* out_conv_tile_sizes);
+
 #endif  // IREE_BUILTINS_UKERNEL_QUERY_TILE_SIZES_INTERNAL_H_

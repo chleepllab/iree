@@ -18,6 +18,8 @@ iree_bitcode_library(
   INTERNAL_HDRS
     "common_riscv_64.h"
     "general_riscv_64.h"
+    "mmt4d_riscv_64_internal.h"
+    "mmt4d_riscv_64_tiles.inl"
     "pack_riscv_64_internal.h"
     "unpack_riscv_64_internal.h"
   SRCS
@@ -37,9 +39,12 @@ iree_bitcode_library(
   INTERNAL_HDRS
     "common_riscv_64.h"
     "general_riscv_64.h"
+    "mmt4d_riscv_64_internal.h"
+    "mmt4d_riscv_64_tiles.inl"
     "pack_riscv_64_internal.h"
     "unpack_riscv_64_internal.h"
   SRCS
+    "mmt4d_riscv_64_v.c"
     "pack_riscv_64_base.c"
     "unpack_riscv_64_base.c"
   COPTS
@@ -86,6 +91,7 @@ iree_cc_library(
   NAME
     riscv_64_v
   SRCS
+    "mmt4d_riscv_64_v.c"
     "pack_riscv_64_base.c"
     "unpack_riscv_64_base.c"
     "general_riscv_64.h"

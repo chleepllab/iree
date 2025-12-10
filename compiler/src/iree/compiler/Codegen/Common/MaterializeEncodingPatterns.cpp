@@ -43,6 +43,7 @@ using IREE::Codegen::TileSwizzle;
 FailureOr<Value> lowerSetEncodingOpToPackOp(
     RewriterBase &rewriter, IREE::Encoding::SetEncodingOp encodingOp,
     Value source, const MaterializeEncodingTypeConverter &typeConverter) {
+  llvm::outs()<<"lowerSetEncodingOpToPackOp\n";
   RankedTensorType resultType = encodingOp.getResultType();
   MaterializeEncodingInfo encodingInfo =
       typeConverter.getEncodingInfo(resultType);
@@ -80,6 +81,7 @@ FailureOr<Value> lowerSetEncodingOpToPackOp(
 FailureOr<Value> lowerUnsetEncodingToUnpackOp(
     RewriterBase &rewriter, IREE::Encoding::UnsetEncodingOp encodingOp,
     Value packedValue, const MaterializeEncodingTypeConverter &typeConverter) {
+  llvm::outs()<<"lowerUnsetEncodingToUnpackOp\n";
   RankedTensorType sourceType = encodingOp.getSourceType();
   MaterializeEncodingInfo encodingInfo =
       typeConverter.getEncodingInfo(sourceType);
@@ -116,6 +118,7 @@ static FailureOr<Operation *>
 lowerOpWithEncoding(RewriterBase &rewriter, tensor::EmptyOp emptyOp,
                     ValueRange convertedOperands,
                     const MaterializeEncodingTypeConverter &typeConverter) {
+  llvm::outs()<<"lowerOpWithEncoding\n";
   auto emptyType = cast<RankedTensorType>(emptyOp->getResultTypes()[0]);
   MaterializeEncodingInfo encodingInfo =
       typeConverter.getEncodingInfo(emptyType);
@@ -154,6 +157,7 @@ static FailureOr<Operation *> lowerGenericOpWithEncoding(
     RewriterBase &rewriter, linalg::GenericOp genericOp,
     ValueRange convertedInputOperands, ValueRange convertedOutputOperands,
     const MaterializeEncodingTypeConverter &typeConverter) {
+  llvm::outs()<<"lowerGenericOpWithEncoding\n";
   OpOperand *outputOperand = genericOp.getDpsInitOperand(0);
   AffineMap outputMap = genericOp.getMatchingIndexingMap(outputOperand);
   if (!outputMap.isIdentity()) {
@@ -394,6 +398,7 @@ lowerOpWithEncoding(RewriterBase &rewriter, linalg::LinalgOp linalgOp,
                     ValueRange convertedInputOperands,
                     ValueRange convertedOutputOperands,
                     const MaterializeEncodingTypeConverter &typeConverter) {
+  llvm::outs()<<"lowerOpWithEncoding with check\n";
   if (!linalgOp.hasPureTensorSemantics()) {
     return rewriter.notifyMatchFailure(linalgOp, "Not pure tensor semantics");
   }

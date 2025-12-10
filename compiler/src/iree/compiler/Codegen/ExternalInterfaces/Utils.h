@@ -35,6 +35,7 @@ struct PackedLayoutMaterializerAttrExternalModelBase
 public:
   IREE::Codegen::MaterializeEncodingInfo
   getEncodingInfo(Attribute attr, RankedTensorType type) const {
+    llvm::outs()<<"Packed getEncodingInfo in Utils.h\n";
     const EncodingPackedLayoutMaterializerAttr *impl =
         static_cast<const EncodingPackedLayoutMaterializerAttr *>(this);
     // If the layout is already resolved, use it directly.
@@ -58,11 +59,13 @@ struct EncodingLayoutMaterializerAttrExternalModelBase
 public:
   IREE::Codegen::MaterializeEncodingInfo
   getEncodingInfo(EncodingLayoutAttr layoutAttr, RankedTensorType type) const {
+    llvm::outs()<<"getEncodingInfo in Utils.h\n";
     return getEncodingInfoFromLayout(
         type, cast<IREE::Encoding::LayoutMaterializerAttr>(layoutAttr));
   }
 
   Type convertType(Attribute attr, Type type) const {
+    llvm::outs()<<"convertType in iree/compiler/Codegen/ExternalInterfaces/Utils.h\n";
     EncodingLayoutAttr layoutAttr = cast<EncodingLayoutAttr>(attr);
     return TypeSwitch<Type, Type>(type)
         .template Case<RankedTensorType>([&](auto type) {

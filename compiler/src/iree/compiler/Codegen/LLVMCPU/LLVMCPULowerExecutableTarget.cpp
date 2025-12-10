@@ -81,6 +81,7 @@ getTilingConfigForPipeline(FunctionOpInterface funcOp) {
 }
 
 void LLVMCPULowerExecutableTargetPass::runOnOperation() {
+  //llvm::outs()<<"LLVMCPULowerExecutableTargetPass::runOnOperation()\n";
   auto funcOp = getOperation();
   auto target = IREE::HAL::ExecutableTargetAttr::lookup(funcOp);
   if (!target) {
@@ -109,6 +110,7 @@ void LLVMCPULowerExecutableTargetPass::runOnOperation() {
   pipelineOpts.enablePeeling = isOptEnabled(funcOp, getEnableLoopPeelingStr());
 
   OpPassManager pipeline(func::FuncOp::getOperationName());
+  //llvm::outs()<<"!!!switch pipeline\n";
   switch (translationInfo.getDispatchLoweringPassPipeline()) {
   // No pipleline specified, nothing to do.
   case IREE::Codegen::DispatchLoweringPassPipeline::None:
@@ -141,19 +143,8 @@ void LLVMCPULowerExecutableTargetPass::runOnOperation() {
                                      pipelineOpts);
     break;
   }
-  case IREE::Codegen::DispatchLoweringPassPipeline::
-      CPUConvTileAndDecomposeExpert: {
-    auto maybeTilingConfig = getTilingConfigForPipeline(funcOp);
-    if (failed(maybeTilingConfig)) {
-      funcOp.emitOpError("Tiling Config is necessary for "
-                         "CPUConvTileAndDecomposeExpert pipeline.");
-      return signalPassFailure();
-    }
-    addConvTileAndDecomposeExpertPassPipeline(pipeline, *maybeTilingConfig,
-                                              pipelineOpts);
-    break;
-  }
   case IREE::Codegen::DispatchLoweringPassPipeline::Mmt4dTilingExpert: {
+    //llvm::outs()<<"switch addMmt4dTilingExpert pipeline.\n";
     auto maybeTilingConfig = getTilingConfigForPipeline(funcOp);
     if (failed(maybeTilingConfig)) {
       funcOp.emitOpError(
@@ -164,7 +155,22 @@ void LLVMCPULowerExecutableTargetPass::runOnOperation() {
                                      pipelineOpts);
     break;
   }
+  case IREE::Codegen::DispatchLoweringPassPipeline::
+      CPUConvTileAndDecomposeExpert: {
+    //llvm::outs()<<"switch CPUConvTileAndDecomposeExpert pipeline.\n";
+    auto maybeTilingConfig = getTilingConfigForPipeline(funcOp);
+    if (failed(maybeTilingConfig)) {
+      funcOp.emitOpError("Tiling Config is necessary for "
+                         "CPUConvTileAndDecomposeExpert pipeline.");
+      return signalPassFailure();
+    }
+    //addConvTileAndDecomposeExpertPassPipeline(pipeline, *maybeTilingConfig,
+    //                                          pipelineOpts);
+    addCPUDataTilingPipeline(pipeline, *maybeTilingConfig, pipelineOpts);
+    break;
+  }
   case IREE::Codegen::DispatchLoweringPassPipeline::CPUDataTiling: {
+    //llvm::outs()<<"switch addCPUDataTilingPipeline.\n";
     auto maybeTilingConfig = getTilingConfigForPipeline(funcOp);
     if (failed(maybeTilingConfig)) {
       funcOp.emitOpError(
@@ -187,6 +193,7 @@ void LLVMCPULowerExecutableTargetPass::runOnOperation() {
     break;
   }
   default:
+    llvm::outs()<<"Unsupported pipeline on CPU target.\n";
     funcOp.emitOpError("Unsupported pipeline on CPU target.");
     return signalPassFailure();
   }

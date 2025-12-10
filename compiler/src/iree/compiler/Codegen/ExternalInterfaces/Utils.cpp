@@ -25,6 +25,7 @@ Value calculatePackedStorageSizeInBytesImpl(Attribute attr, Location loc,
                                             OpBuilder &builder,
                                             RankedTensorType type,
                                             ValueRange dynamicDims) {
+  llvm::outs()<<"calculatePackedStorageSizeInBytesImpl\n";
   auto deviceLayoutAttr =
       cast<IREE::Codegen::PackedLayoutMaterializerAttr>(attr);
   MaterializeEncodingInfo encodingInfo = deviceLayoutAttr.getEncodingInfo(type);
@@ -96,6 +97,7 @@ Value calculatePackedStorageSizeInBytesImpl(Attribute attr, Location loc,
 
 DictionaryAttr getPackedLayoutImpl(Attribute attr, RankedTensorType type,
                                    bool addEncodingAttr) {
+  llvm::outs()<<"getPackedLayoutImpl\n";
   MLIRContext *ctx = attr.getContext();
   auto deviceLayoutAttr =
       cast<IREE::Codegen::PackedLayoutMaterializerAttr>(attr);

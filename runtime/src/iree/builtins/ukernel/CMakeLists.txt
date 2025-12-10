@@ -24,6 +24,8 @@ add_custom_command(OUTPUT internal_headers_filegroup.stamp
     COMMAND ${CMAKE_COMMAND} -E touch internal_headers_filegroup.stamp
   DEPENDS
     "common.h"
+    "conv_2d_nchw_fchw.h"
+    "conv_2d_nchw_fchw_internal.h"
     "exported_bits.h"
     "mmt4d.h"
     "mmt4d_internal.h"
@@ -44,6 +46,8 @@ iree_cc_library(
     internal_headers
   HDRS
     "common.h"
+    "conv_2d_nchw_fchw.h"
+    "conv_2d_nchw_fchw_internal.h"
     "exported_bits.h"
     "mmt4d.h"
     "mmt4d_internal.h"
@@ -63,6 +67,8 @@ iree_cc_library(
     fallback
   HDRS
     "common.h"
+    "conv_2d_nchw_fchw.h"
+    "conv_2d_nchw_fchw_internal.h"
     "exported_bits.h"
     "mmt4d.h"
     "mmt4d_internal.h"
@@ -86,6 +92,10 @@ iree_cc_library(
     "api.h"
   SRCS
     "common.h"
+    "conv_2d_nchw_fchw.c"
+    "conv_2d_nchw_fchw.h"
+    "conv_2d_nchw_fchw_internal.h"
+    "conv_2d_nchw_fchw_tile_generic.c"
     "exported_bits.h"
     "mmt4d.c"
     "mmt4d.h"
@@ -120,6 +130,8 @@ iree_bitcode_library(
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "internal_headers_filegroup.stamp"
   SRCS
+    "conv_2d_nchw_fchw.c"
+    "conv_2d_nchw_fchw_tile_generic.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"
     "pack.c"
@@ -137,6 +149,8 @@ iree_bitcode_library(
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "internal_headers_filegroup.stamp"
   SRCS
+    "conv_2d_nchw_fchw.c"
+    "conv_2d_nchw_fchw_tile_generic.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"
     "pack.c"
@@ -154,6 +168,8 @@ iree_bitcode_library(
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "internal_headers_filegroup.stamp"
   SRCS
+    "conv_2d_nchw_fchw.c"
+    "conv_2d_nchw_fchw_tile_generic.c"
     "fallback.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"
@@ -172,6 +188,8 @@ iree_bitcode_library(
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "internal_headers_filegroup.stamp"
   SRCS
+    "conv_2d_nchw_fchw.c"
+    "conv_2d_nchw_fchw_tile_generic.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"
     "pack.c"
@@ -189,6 +207,8 @@ iree_bitcode_library(
     "${PROJECT_BINARY_DIR}/runtime/src/iree/schemas/cpu_data_headers_filegroup.stamp"
     "internal_headers_filegroup.stamp"
   SRCS
+    "conv_2d_nchw_fchw.c"
+    "conv_2d_nchw_fchw_tile_generic.c"
     "fallback.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"

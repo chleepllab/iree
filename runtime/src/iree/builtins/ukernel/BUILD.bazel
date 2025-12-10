@@ -30,6 +30,8 @@ internal_headers = [
     "query_tile_sizes_internal.h",
     "unpack.h",
     "unpack_internal.h",
+    "conv_2d_nchw_fchw.h",
+    "conv_2d_nchw_fchw_internal.h"
 ]
 
 # Filegroup used in Bazel only (only Bazel enforces header dependencies).
@@ -65,6 +67,8 @@ iree_runtime_cc_library(
         "query_tile_sizes.c",
         "unpack.c",
         "unpack_tile.c",
+        "conv_2d_nchw_fchw.c",
+        "conv_2d_nchw_fchw_tile_generic.c",
     ] + internal_headers,
     hdrs = ["api.h"],
     deps = [
@@ -118,6 +122,8 @@ bitcode_specific_archs = [
         "pack_tile.c",
         "unpack.c",
         "unpack_tile.c",
+        "conv_2d_nchw_fchw.c",
+        "conv_2d_nchw_fchw_tile_generic.c",
     ] + ([] if arch in bitcode_specific_archs else ["fallback.c"]),
     arch = arch,
     internal_hdrs = [

@@ -223,10 +223,10 @@ TileMxNxK chooseMatmulTile(ArrayRef<TileMxNxK> enumeratedTiles,
     }
     ratedTile.productMxNxK = tile.M * tile.N * tile.K;
     ratedTiles.push_back(ratedTile);
-    LLVM_DEBUG(llvm::dbgs()
+    llvm::dbgs()
                << "candidate: "
                << llvm::interleaved(ArrayRef{tile.M, tile.N, tile.K})
-               << " penalty:" << ratedTile.paddingPenalty << "\n");
+               << " penalty:" << ratedTile.paddingPenalty << "\n";
     bestPaddingPenalty = std::min(bestPaddingPenalty, ratedTile.paddingPenalty);
   }
   RatedTileMxNxK bestRatedTile;
@@ -241,17 +241,18 @@ TileMxNxK chooseMatmulTile(ArrayRef<TileMxNxK> enumeratedTiles,
   // Sanity check. This assert can only fail if there's a programming mistake
   // locally here.
   assert(bestRatedTile.paddingPenalty == bestPaddingPenalty);
-  LLVM_DEBUG(
+  //LLVM_DEBUG(
       llvm::dbgs() << "bestRatedTile: "
                    << llvm::interleaved(ArrayRef{
                           bestRatedTile.M, bestRatedTile.N, bestRatedTile.K})
-                   << " penalty:" << bestRatedTile.paddingPenalty << "\n");
+                   << " penalty:" << bestRatedTile.paddingPenalty << "\n";
   return bestRatedTile;
 }
 
 FailureOr<Operation *> lowerContractionOpWithEncoding(
     OpBuilder &builder, linalg::LinalgOp linalgOp, ValueRange operands,
     IREE::Encoding::LayoutMaterializerAttr layoutAttr) {
+  llvm::outs()<<"lowerContractionOpWithEncoding\n";
   if (!linalgOp.hasPureTensorSemantics()) {
     return failure();
   }
@@ -344,8 +345,13 @@ enumerateMatmulTileRiscv32(DictionaryAttr config) {
 static SmallVector<TileMxNxK>
 enumerateMatmulTileRiscv64(DictionaryAttr config) {
   if (hasUkernel(config)) {
+    //return {
+    //    TileMxNxK{8, 8, 1}, // Some reasonable tile shape.
+    //};
+    size_t vlen = 256;
+    int N0 = vlen / 8;
     return {
-        TileMxNxK{8, 8, 1}, // Some reasonable tile shape.
+        TileMxNxK{7, N0, 1}, // Aim to use vfmacc, 100% register utilization.
     };
   }
   // Fallback - no architecture-optimized tile size for this case.
@@ -586,6 +592,7 @@ struct CPUEncodingPackedLayoutMaterializerAttr
 
   MaterializeEncodingInfo getEncodingInfoImpl(Attribute attr,
                                               RankedTensorType type) const {
+    llvm::outs()<<"Begin getEncodingInfoImpl\n";
     auto layoutAttr = cast<CPUEncodingLayoutAttr>(attr);
 
     auto encoding = llvm::dyn_cast_or_null<IREE::Encoding::EncodingAttr>(
@@ -613,6 +620,7 @@ struct CPUEncodingPackedLayoutMaterializerAttr
     // taking narrow dimensions into account.
     TileMxNxK chosenTileMxNxK =
         chooseMatmulTile(enumeratedTileMxNxK, narrowDim);
+    llvm::outs()<<"Finish chooseMatmulTile\n";
     FailureOr<MaterializeEncodingInfo> maybeEncodingInfo =
         getEncodingInfoForMatmul(encoding, chosenTileMxNxK);
     if (failed(maybeEncodingInfo)) {
@@ -633,6 +641,7 @@ struct CPUEncodingLayoutMaterializerAttr final
   Operation *lowerOp(Attribute attr, OpBuilder &b, Operation *op,
                      TypeRange convertedResTypes,
                      ValueRange convertedOperands) const {
+    llvm::outs()<<"lowerOp\n";
     auto layoutAttr = cast<CPUEncodingLayoutAttr>(attr);
     auto linalgOp = llvm::dyn_cast<linalg::LinalgOp>(op);
     if (!linalgOp) {
@@ -769,6 +778,7 @@ struct VMVXEncodingLayoutMaterializerAttr final
   Operation *lowerOp(Attribute attr, OpBuilder &b, Operation *op,
                      TypeRange convertedResTypes,
                      ValueRange convertedOperands) const {
+    llvm::outs()<<"VMVX lowerOp\n";
     auto layoutAttr = cast<VMVXEncodingLayoutAttr>(attr);
     auto linalgOp = llvm::dyn_cast<linalg::LinalgOp>(op);
     if (!linalgOp) {

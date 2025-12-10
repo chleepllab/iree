@@ -35,6 +35,7 @@ createFunctionCall(RewriterBase &rewriter, Operation *op, StringRef fnName,
                    TypeRange callArgumentTypes, TypeRange callReturnTypes,
                    ValueRange callOperands,
                    ArrayRef<NamedAttribute> fnDefAttrs) {
+  llvm::outs()<<"createFunctionCall() in iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.cpp\n";
   FunctionType functionType =
       rewriter.getFunctionType(callArgumentTypes, callReturnTypes);
 
@@ -79,6 +80,7 @@ static LogicalResult getCallOpType(MLIRContext *context,
                                    Type microKernelOpOperandType,
                                    IntegerAttr stridedOuterDimsAttr,
                                    SmallVector<Type> &callOperandTypes) {
+  llvm::outs()<<"getCallOpType() in iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.cpp\n";
   return TypeSwitch<Type, LogicalResult>(microKernelOpOperandType)
       .Case<FloatType, IndexType, IntegerType>([&](auto scalarType) {
         callOperandTypes.push_back(scalarType);
@@ -114,6 +116,7 @@ static LogicalResult lowerToCallOperands(Location loc, RewriterBase &rewriter,
                                          Value operand,
                                          IntegerAttr stridedOuterDimsAttr,
                                          SmallVector<Value> &callOperands) {
+  llvm::outs()<<"lowerToCallOperands() in iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.cpp\n";
   return TypeSwitch<Type, LogicalResult>(operand.getType())
       .Case<FloatType, IndexType, IntegerType>([&](auto scalarType) {
         callOperands.push_back(operand);
@@ -147,6 +150,7 @@ static LogicalResult lowerToCallOperands(Location loc, RewriterBase &rewriter,
 static FailureOr<func::CallOp> lowerUKernelGenericToFunctionCall(
     RewriterBase &rewriter, IREE::Codegen::UKernelGenericOp op,
     StringRef fnName, IntegerAttr stridedOuterDimsAttr) {
+  llvm::outs()<<"lowerUKernelGenericToFunctionCall() in iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.cpp\n";
   // Create the function type based on the operands and results.
   SmallVector<Type> callArgumentTypes;
   for (auto microKernelOpOperandType : op->getOperandTypes()) {
@@ -193,6 +197,7 @@ MutableOperandRange UKernelGenericOp::getDpsInitsMutable() {
 
 FailureOr<mlir::CallOpInterface>
 UKernelGenericOp::lowerToFunctionCall(RewriterBase &rewriter) {
+  llvm::outs()<<"UKernelGenericOp::lowerToFunctionCall() in iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.cpp\n";
   return lowerUKernelGenericToFunctionCall(rewriter, *this, getUKernelFnName(),
                                            getStridedOuterDimsAttr());
 }

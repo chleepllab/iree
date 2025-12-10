@@ -17,6 +17,7 @@ namespace mlir::iree_compiler {
 
 static std::optional<IREE::Codegen::MaterializeEncodingInfo>
 getEncodingInfoFromType(RankedTensorType type) {
+  llvm::outs()<<"getEncodingInfoFromType in EncodingUtils.cpp\n";
   auto layoutAttr =
       dyn_cast_or_null<IREE::Encoding::LayoutAttr>(type.getEncoding());
   if (!layoutAttr) {
@@ -34,6 +35,7 @@ getEncodingInfoFromType(RankedTensorType type) {
 IREE::Codegen::MaterializeEncodingInfo
 getEncodingInfoFromLayout(RankedTensorType type,
                           IREE::Encoding::LayoutMaterializerAttr layoutAttr) {
+  llvm::outs()<<"getEncodingInfoFromLayout in EncodingUtils.cpp\n";
   // If the layout is present in the encoding, use it directly. It means that
   // the layout is already resolved and some information could be dropped during
   // the lowering. Thus, we prioritize the resolved layout.

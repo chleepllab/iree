@@ -462,15 +462,59 @@ void addMultiTilingExpertPassPipeline(OpPassManager &funcPassManager,
   }
 }
 
+void addMmt4dTilingExpertPassPipeline(OpPassManager &funcPassManager,
+                                      TilingConfig &tilingConfig,
+                                      LLVMCPUPipelineOptions &pipelineOpt) {
+  llvm::outs()<<"addMmt4dTilingExpertPassPipeline()\n";
+  addTileAndDistributePasses(funcPassManager);
+
+  funcPassManager.addPass(createLLVMCPUTileRootAndFuseProducerConsumer(
+      static_cast<int64_t>(tilingConfig.getVectorCommonParallelLevel())));
+  // The below two passes are nop if the "mmt4d" is explicitly excluded in the
+  // ukernels attribute.
+  funcPassManager.addPass(createCPUPrepareUkernelsPass());
+  funcPassManager.addPass(
+      createCPULowerToUKernelsPass(clSkipIntermediateRoundings));
+  funcPassManager.addPass(createLLVMCPUTileRootAndFuseInputOperands(
+      static_cast<int64_t>(tilingConfig.getVectorReductionLevel())));
+
+  {
+    GenericVectorizationPassOptions options;
+    options.enableVectorMasking = pipelineOpt.enableVectorMasking;
+    options.vectorizePadding = true;
+    options.vectorizeGatherAccesses = true;
+    funcPassManager.addPass(createGenericVectorizationPass(options));
+    funcPassManager.addPass(createOptimizeTensorInsertExtractSlicesPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+    if (clFailOnLargeVector) {
+      funcPassManager.addPass(createLLVMCPUVerifyVectorSizeLegalityPass());
+    }
+  }
+
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  addCPUBufferizePasses(funcPassManager);
+
+  // Vector lowering of Mmt4d.
+  funcPassManager.addPass(createLLVMCPUMmt4dVectorLoweringPass(
+      LLVMCPUMmt4dVectorLoweringPassOptions{
+          clEnableVectorContractCustomKernels}));
+
+  // Generic vector lowering.
+  LLVMCPUVectorLoweringPassOptions options;
+  options.lowerVectorTransposeToAVX2 = pipelineOpt.lowerToAVX2;
+  options.splitVectorTransfersTo = "linalg-copy";
+  options.enableArmI8mm = pipelineOpt.enableAArch64I8mm;
+  options.enableArmSME = pipelineOpt.enableAArch64SME;
+  buildLLVMCPUVectorLoweringPipeline(funcPassManager, options);
+}
+
 void addConvTileAndDecomposeExpertPassPipeline(
     OpPassManager &funcPassManager, TilingConfig &tilingConfig,
     LLVMCPUPipelineOptions &pipelineOpt) {
   addTileAndDistributePasses(funcPassManager);
-
-  // Run LLVMTileAndFuse firstly in case that we have fill + conv + generic
-  // ops. At this stage, we do not apply vectorization. The reduction dim won't
-  // get tiled if the case is conv + generic op. In this case, we have to tile
-  // along reduction dim again, which needs them to be Linalg ops form.
 
   funcPassManager.addPass(createLLVMCPUTileAndFusePass(
       tilingConfig.getVectorCommonParallelLevel()));
@@ -526,57 +570,10 @@ void addConvTileAndDecomposeExpertPassPipeline(
   }
 }
 
-void addMmt4dTilingExpertPassPipeline(OpPassManager &funcPassManager,
-                                      TilingConfig &tilingConfig,
-                                      LLVMCPUPipelineOptions &pipelineOpt) {
-  addTileAndDistributePasses(funcPassManager);
-
-  funcPassManager.addPass(createLLVMCPUTileRootAndFuseProducerConsumer(
-      static_cast<int64_t>(tilingConfig.getVectorCommonParallelLevel())));
-  // The below two passes are nop if the "mmt4d" is explicitly excluded in the
-  // ukernels attribute.
-  funcPassManager.addPass(createCPUPrepareUkernelsPass());
-  funcPassManager.addPass(
-      createCPULowerToUKernelsPass(clSkipIntermediateRoundings));
-  funcPassManager.addPass(createLLVMCPUTileRootAndFuseInputOperands(
-      static_cast<int64_t>(tilingConfig.getVectorReductionLevel())));
-
-  {
-    GenericVectorizationPassOptions options;
-    options.enableVectorMasking = pipelineOpt.enableVectorMasking;
-    options.vectorizePadding = true;
-    options.vectorizeGatherAccesses = true;
-    funcPassManager.addPass(createGenericVectorizationPass(options));
-    funcPassManager.addPass(createOptimizeTensorInsertExtractSlicesPass());
-    funcPassManager.addPass(createCanonicalizerPass());
-    funcPassManager.addPass(createCSEPass());
-    if (clFailOnLargeVector) {
-      funcPassManager.addPass(createLLVMCPUVerifyVectorSizeLegalityPass());
-    }
-  }
-
-  funcPassManager.addPass(createCanonicalizerPass());
-  funcPassManager.addPass(createCSEPass());
-
-  addCPUBufferizePasses(funcPassManager);
-
-  // Vector lowering of Mmt4d.
-  funcPassManager.addPass(createLLVMCPUMmt4dVectorLoweringPass(
-      LLVMCPUMmt4dVectorLoweringPassOptions{
-          clEnableVectorContractCustomKernels}));
-
-  // Generic vector lowering.
-  LLVMCPUVectorLoweringPassOptions options;
-  options.lowerVectorTransposeToAVX2 = pipelineOpt.lowerToAVX2;
-  options.splitVectorTransfersTo = "linalg-copy";
-  options.enableArmI8mm = pipelineOpt.enableAArch64I8mm;
-  options.enableArmSME = pipelineOpt.enableAArch64SME;
-  buildLLVMCPUVectorLoweringPipeline(funcPassManager, options);
-}
-
 void addCPUDataTilingPipeline(OpPassManager &funcPassManager,
                               TilingConfig &tilingConfig,
                               LLVMCPUPipelineOptions &pipelineOpt) {
+  //llvm::outs()<<"addCPUDataTilingPipeline()\n";
   addTileAndDistributePasses(funcPassManager);
 
   // The below two passes are nop if pack/unpack is not specified in ukernels

@@ -434,6 +434,7 @@ private:
 LogicalResult setDefaultCustomOpLoweringConfig(
     FunctionOpInterface funcOp, IREE::LinalgExt::CustomOp customOp,
     std::function<LogicalResult(FunctionOpInterface)> configFn) {
+  llvm::outs()<<"setDefaultCustomOpLowerConfig()\n";
 
   MLIRContext *context = funcOp.getContext();
   IRRewriter rewriter(context);

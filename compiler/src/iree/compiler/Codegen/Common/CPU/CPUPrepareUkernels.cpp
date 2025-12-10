@@ -44,6 +44,37 @@ static void tileBatchDimsForBatchMmt4dOp(RewriterBase &rewriter,
   });
 }
 
+static void tileBatchDimsForConvOps(RewriterBase &rewriter,
+                                    FunctionOpInterface funcOp) {
+  funcOp.walk([&](linalg::Conv2DNchwFchwOp convOp) {
+    auto out = convOp.getDpsInitOperand(0)->get();
+    auto outType = cast<RankedTensorType>(out.getType());
+
+    // Only tile non-unit batch dimensions with tile size equals to 1.
+    if (outType.getShape()[0] <= 1) {
+      return;
+    }
+
+    SmallVector<OpFoldResult> tileSizes = {rewriter.getIndexAttr(1)};
+    // Add zeros for other dimensions to keep them unchanged
+    for (int i = 1; i < outType.getRank(); ++i) {
+      tileSizes.push_back(rewriter.getIndexAttr(0));
+    }
+
+    auto tilingInterfaceOp = cast<TilingInterface>(convOp.getOperation());
+    auto options = scf::SCFTileAndFuseOptions().setTilingOptions(
+        scf::SCFTilingOptions().setTileSizes(tileSizes));
+    FailureOr<scf::SCFTileAndFuseResult> tileAndFuseResult =
+        scf::tileConsumerAndFuseProducersUsingSCF(rewriter, tilingInterfaceOp,
+                                                  options);
+    if (succeeded(tileAndFuseResult)) {
+      rewriter.replaceOp(
+          convOp,
+          tileAndFuseResult->replacements[convOp.getResult(0)]);
+    }
+  });
+}
+
 static void tileNonPackedDimsFor3DPackOps(RewriterBase &rewriter,
                                           FunctionOpInterface funcOp) {
   funcOp.walk([&](linalg::PackOp packOp) {
@@ -251,11 +282,100 @@ struct ConvertBatchMmt4DtoMmt4DPattern
   }
 };
 
+struct ConvertConv2DNchwFchwPattern
+    : public OpRewritePattern<linalg::Conv2DNchwFchwOp> {
+  using OpRewritePattern<linalg::Conv2DNchwFchwOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::Conv2DNchwFchwOp op,
+                                PatternRewriter &rewriter) const override {
+    //llvm::outs()<<"ConvertConv2DNchwFchwPattern::matchAndRewrite()\n";
+    auto input = op.getDpsInputOperand(0)->get();
+    auto filter = op.getDpsInputOperand(1)->get();
+    auto output = op.getDpsInitOperand(0)->get();
+
+    auto inputType = cast<RankedTensorType>(input.getType());
+    auto filterType = cast<RankedTensorType>(filter.getType());
+    auto outputType = cast<RankedTensorType>(output.getType());
+
+    // Check for unit dimensions that can be reduced
+    SmallVector<int64_t> unitDims;
+    for (int64_t i = 0; i < inputType.getRank(); ++i) {
+      if (inputType.getDimSize(i) == 1) {
+        unitDims.push_back(i);
+      }
+    }
+
+    // If no unit dimensions, nothing to do
+    if (unitDims.empty()) {
+      return failure();
+    }
+
+    Location loc = op.getLoc();
+
+    // Create reduced input type and extract slice
+    auto reducedInputType = inputType;
+    for (auto dim : llvm::reverse(unitDims)) {
+      reducedInputType = RankedTensorType::Builder(reducedInputType).dropDim(dim);
+    }
+    auto reducedInput = tensor::createCanonicalRankReducingExtractSliceOp(
+        rewriter, loc, input, reducedInputType);
+
+    // Create reduced output type and extract slice
+    auto reducedOutputType = outputType;
+    for (auto dim : llvm::reverse(unitDims)) {
+      // For output, we need to consider which dimensions correspond to input dimensions
+      // In NHWC format, dimensions 1, 2 (H, W) are spatial dimensions that might be affected
+      if (dim < reducedOutputType.getRank()) {
+        reducedOutputType = RankedTensorType::Builder(reducedOutputType).dropDim(dim);
+      }
+    }
+    auto reducedOutput = tensor::createCanonicalRankReducingExtractSliceOp(
+        rewriter, loc, output, reducedOutputType);
+
+    // Create reduced filter type - note: filter has format HWCF
+    // We need to handle filter dimension reduction carefully
+    auto reducedFilterType = filterType;
+    // For filter, we only drop unit dimensions in spatial dimensions (0, 1)
+    SmallVector<int64_t> filterUnitDims;
+    for (int64_t i = 0; i < 2; ++i) { // Only check spatial dimensions H, W
+      if (filterType.getDimSize(i) == 1) {
+        filterUnitDims.push_back(i);
+      }
+    }
+    for (auto dim : llvm::reverse(filterUnitDims)) {
+      reducedFilterType = RankedTensorType::Builder(reducedFilterType).dropDim(dim);
+    }
+    auto reducedFilter = tensor::createCanonicalRankReducingExtractSliceOp(
+        rewriter, loc, filter, reducedFilterType);
+
+    // Create new convolution operation with reduced dimensions
+    auto newConvOp = rewriter.create<linalg::Conv2DNchwFchwOp>(
+        loc, reducedOutput.getType(),
+        ValueRange{reducedInput, reducedFilter},
+        ValueRange{reducedOutput});
+
+    // Copy attributes from original operation
+    if (auto strides = op.getStrides()) {
+      newConvOp.setStridesAttr(strides);
+    }
+    if (auto dilations = op.getDilations()) {
+      newConvOp.setDilationsAttr(dilations);
+    }
+
+    // Insert slice back to original output
+    auto insertSliceOp = tensor::createCanonicalRankReducingInsertSliceOp(
+        rewriter, loc, newConvOp.getResult(0), output);
+    rewriter.replaceOp(op, insertSliceOp);
+    return success();
+  }
+};
+
 struct Convert3DPackto2DPackPattern : public OpRewritePattern<linalg::PackOp> {
   using OpRewritePattern<linalg::PackOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(linalg::PackOp packOp,
                                 PatternRewriter &rewriter) const override {
+    //llvm::outs()<<"Convert3DPackto2DPackPattern::matchAndRewrite()\n";
     if (packOp.getSourceRank() != 3 || packOp.getDestRank() != 5) {
       return failure();
     }
@@ -411,6 +531,7 @@ struct CPUPrepareUkernelsPass
 } // namespace
 
 void CPUPrepareUkernelsPass::runOnOperation() {
+  //llvm::outs()<<"CPUPrepareUkernelsPass::runOnOperation()\n";
   MLIRContext *ctx = &getContext();
   RewritePatternSet patterns(ctx);
   auto funcOp = getOperation();
@@ -420,6 +541,11 @@ void CPUPrepareUkernelsPass::runOnOperation() {
   if (hasUkernel(targetAttr, "mmt4d")) {
     tileBatchDimsForBatchMmt4dOp(rewriter, funcOp);
     patterns.add<ConvertBatchMmt4DtoMmt4DPattern>(ctx);
+  }
+  if (hasUkernel(targetAttr, "conv_2d_nchw_fchw")) {
+    //llvm::outs()<<"conv_2d_nchw_fchw hasUkernel\n";
+    tileBatchDimsForConvOps(rewriter, funcOp);
+    patterns.add<ConvertConv2DNchwFchwPattern>(ctx);
   }
   if (hasUkernel(targetAttr, "pack")) {
     tileNonPackedDimsFor3DPackOps(rewriter, funcOp);

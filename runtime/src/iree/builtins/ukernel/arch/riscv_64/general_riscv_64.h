@@ -29,7 +29,7 @@ static inline void iree_uk_memcpy_riscv_64(void* IREE_UK_RESTRICT dst,
                                   iree_uk_index_t elem_size) {
   //for (iree_uk_index_t i = 0; i < size; ++i)
   //  ((char*)dst)[i] = ((const char*)src)[i];
-  iree_uk_index_t n = size;
+  iree_uk_index_t n = size / elem_size;
   if (elem_size == 4) {
     iree_uk_int32_t* IREE_UK_RESTRICT out_ptr = dst;
     const iree_uk_int32_t* IREE_UK_RESTRICT in_ptr = src;
@@ -38,6 +38,9 @@ static inline void iree_uk_memcpy_riscv_64(void* IREE_UK_RESTRICT dst,
       vl = __riscv_vsetvl_e32m1(n - i);
       vint32m1_t vec = __riscv_vle32_v_i32m1((const int32_t*)(in_ptr + i), vl);
       __riscv_vse32_v_i32m1((int32_t*)(out_ptr + i), vec, vl);
+      //vint32m1_t vec = __riscv_vle32_v_i32m1((const int32_t*)(in_ptr + i), vl);
+      //vint32m1_t gather = __riscv_vrgather_vv_i32m1(vec, __riscv_vid_v_u32m1(vl), vl);
+      //__riscv_vse32_v_i32m1((int32_t*)(out_ptr + i), gather, vl);
     }
   } else if (elem_size == 1) {
     iree_uk_int8_t* IREE_UK_RESTRICT out_ptr = dst;

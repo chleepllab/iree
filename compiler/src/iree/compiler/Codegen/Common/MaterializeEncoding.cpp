@@ -46,6 +46,7 @@ static LogicalResult
 materializeFuncOpEncodings(FunctionOpInterface funcOp,
                            IREE::HAL::ExecutableTargetAttr targetAttr,
                            bool testCLGPUTarget = false) {
+  llvm::outs()<<"materializeFuncOpEncodings()\n";
   MLIRContext *ctx = funcOp.getContext();
   {
     RewritePatternSet patterns(ctx);
@@ -171,12 +172,14 @@ getFuncExecutableTargetAttrs(FunctionOpInterface funcOp,
 struct MaterializeHostEncodingPass final
     : impl::MaterializeHostEncodingPassBase<MaterializeHostEncodingPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
+    llvm::outs()<<"MaterializeHostEncodingPass::getDependentDialects()\n";
     registry.insert<arith::ArithDialect, tensor::TensorDialect,
                     IREE::Codegen::IREECodegenDialect,
                     IREE::CPU::IREECPUDialect, IREE::GPU::IREEGPUDialect>();
   }
 
   void runOnOperation() override {
+    llvm::outs()<<"MaterializeHostEncodingPass::runOnOperation()\n";
     ModuleOp moduleOp = getOperation();
 
     // Run required analysis passes.
@@ -233,12 +236,14 @@ struct MaterializeDeviceEncodingPass final
   using Base::Base;
 
   void getDependentDialects(DialectRegistry &registry) const override {
+    llvm::outs()<<"MaterializeDeviceEncodingPass::getDependentDialects()\n";
     registry.insert<arith::ArithDialect, tensor::TensorDialect,
                     IREE::Codegen::IREECodegenDialect,
                     IREE::CPU::IREECPUDialect, IREE::GPU::IREEGPUDialect>();
   }
 
   void runOnOperation() override {
+    llvm::outs()<<"MaterializeDeviceEncodingPass::runOnOperation()\n";
     FunctionOpInterface funcOp = getOperation();
     auto executableTargetAttr = IREE::HAL::ExecutableTargetAttr::lookup(funcOp);
     if (failed(materializeFuncOpEncodings(funcOp, executableTargetAttr,

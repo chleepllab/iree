@@ -88,6 +88,7 @@ MaterializeEncodingConversionTarget::MaterializeEncodingConversionTarget(
 
 IREE::Codegen::MaterializeEncodingInfo
 MaterializeEncodingTypeConverter::getEncodingInfo(RankedTensorType type) const {
+  llvm::outs()<<"getEncodingInfo in Codegen/Common/EncodingUtils.cpp\n";
   return getEncodingInfoFromLayout(type, layoutAttr);
 }
 

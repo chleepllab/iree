@@ -266,6 +266,136 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Mmt4DOp op,
 }
 
 static FailureOr<IREE::Codegen::UKernelOpInterface>
+matchDAGForUKernel(RewriterBase &rewriter, linalg::Conv2DNchwFchwOp op,
+                   bool /*skipIntermediateRoundings*/) {
+  //llvm::outs()<<"matchDAGForUKernel Conv2D\n";
+  auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(op);
+  const char ukernelName[] = "conv_2d_nchw_fchw";
+  //if (!hasUkernel(targetAttr, ukernelName)) {
+  //  return failure();
+  //}
+
+  Value input = op.getDpsInputOperand(0)->get();
+  Value filter = op.getDpsInputOperand(1)->get();
+  Value output = op.getDpsInitOperand(0)->get();
+
+  auto inputType = llvm::cast<ShapedType>(input.getType());
+  auto filterType = llvm::cast<ShapedType>(filter.getType());
+  auto outputType = llvm::cast<ShapedType>(output.getType());
+
+  Type inputElemType = inputType.getElementType();
+  Type filterElemType = filterType.getElementType();
+  Type outputElemType = outputType.getElementType();
+
+  uint32_t flags = 0;
+
+  if (inputElemType.isF32() && filterElemType.isF32() && outputElemType.isF32()) {
+    flags = IREE_UK_FLAG_CONV_TYPE_F32F32F32;
+  } else if (inputElemType.isF16() && filterElemType.isF16() && outputElemType.isF32()) {
+    flags = IREE_UK_FLAG_CONV_TYPE_F16F16F32;
+  } else if (inputElemType.isF16() && filterElemType.isF16() && outputElemType.isF16()) {
+    flags = IREE_UK_FLAG_CONV_TYPE_F16F16F16;
+  } else if (inputElemType.isBF16() && filterElemType.isBF16() && outputElemType.isF32()) {
+    flags = IREE_UK_FLAG_CONV_TYPE_BF16BF16F32;
+  } else if (inputElemType.isBF16() && filterElemType.isBF16() && outputElemType.isBF16()) {
+    flags = IREE_UK_FLAG_CONV_TYPE_BF16BF16BF16;
+  } else if (inputElemType.isSignlessInteger(8) && filterElemType.isSignlessInteger(8) &&
+             outputElemType.isSignlessInteger(32)) {
+    flags = IREE_UK_FLAG_CONV_TYPE_S8S8S32;
+  } else {
+    return rewriter.notifyMatchFailure(
+        op, "unsupported combination of element types for convolution");
+  }
+
+  if (isInitializedToZero(output)) {
+    if (auto fillOp = output.getDefiningOp<linalg::FillOp>()) {
+      output = fillOp.getDpsInitOperand(0)->get();
+    }
+  } else {
+    flags |= IREE_UK_FLAG_CONV_ACCUMULATE;
+  }
+
+  Location loc = op.getLoc();
+
+  Value n = rewriter.create<tensor::DimOp>(loc, input, 0);  // batch
+  Value h = rewriter.create<tensor::DimOp>(loc, input, 2);  // height
+  Value w = rewriter.create<tensor::DimOp>(loc, input, 3);  // width
+  Value c = rewriter.create<tensor::DimOp>(loc, input, 1);  // input channels
+
+  Value fh = rewriter.create<tensor::DimOp>(loc, filter, 2);  // filter height
+  Value fw = rewriter.create<tensor::DimOp>(loc, filter, 3);  // filter width
+  Value oc = rewriter.create<tensor::DimOp>(loc, filter, 0);  // output channels
+  Value ic = rewriter.create<tensor::DimOp>(loc, filter, 1);  // input channels
+
+  auto strides = op.getStrides();
+  auto dilations = op.getDilations();
+
+  SmallVector<int64_t> stridesValues;
+  if (strides) {
+    for (auto stride : strides.getValues<int64_t>()) {
+      stridesValues.push_back(stride);
+    }
+  } else {
+    stridesValues = {1, 1};
+  }
+
+  SmallVector<int64_t> dilationsValues;
+  if (dilations) {
+    for (auto dilation : dilations.getValues<int64_t>()) {
+      dilationsValues.push_back(dilation);
+    }
+  } else {
+    dilationsValues = {1, 1};
+  }
+
+  SmallVector<int64_t> paddingValues = {0, 0};
+
+  Value stride_h = rewriter.create<arith::ConstantIntOp>(
+      loc, stridesValues[0], rewriter.getI32Type());
+  Value stride_w = rewriter.create<arith::ConstantIntOp>(
+      loc, stridesValues[1], rewriter.getI32Type());
+
+  Value dilation_h = rewriter.create<arith::ConstantIntOp>(
+      loc, dilationsValues[0], rewriter.getI32Type());
+  Value dilation_w = rewriter.create<arith::ConstantIntOp>(
+      loc, dilationsValues[1], rewriter.getI32Type());
+
+  Value padding_h = rewriter.create<arith::ConstantIntOp>(
+      loc, paddingValues[0], rewriter.getI32Type());
+  Value padding_w = rewriter.create<arith::ConstantIntOp>(
+      loc, paddingValues[1], rewriter.getI32Type());
+
+  Value flagsVal = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI32IntegerAttr(flags));
+
+  auto fn = getFnNameAndDefAttrs(ukernelName, rewriter, targetAttr);
+  SmallVector<Type> returnTypes =
+      getUKernelGenericReturnTypes(targetAttr, outputType);
+
+  auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
+      loc, returnTypes, fn.name, ValueRange{input, filter}, output,
+      ValueRange{
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), n),
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), h),
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), w),
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), c),
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), fh),
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), fw),
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), oc),
+          rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), ic),
+          stride_h, stride_w,
+          dilation_h, dilation_w,
+          padding_h, padding_w,
+          flagsVal
+      },
+      /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
+      /*strided_outer_dims=*/rewriter.getIndexAttr(1));
+
+  return cast<IREE::Codegen::UKernelOpInterface>(
+      genericMicroKernelOp.getOperation());
+}
+
+static FailureOr<IREE::Codegen::UKernelOpInterface>
 matchDAGForUKernel(RewriterBase &rewriter, linalg::PackOp op,
                    bool /*skipIntermediateRoundings*/) {
   auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(op);
@@ -524,6 +654,7 @@ static uint32_t getFlagForIndex(int64_t operandIndex) {
 static FailureOr<IREE::Codegen::UKernelOpInterface>
 matchDAGForUKernel(RewriterBase &rewriter, IREE::Codegen::QueryTileSizesOp op,
                    bool /*skipIntermediateRoundings*/) {
+  //llvm::outs()<<"matchDAGForUKernel QueryTileSizesOp\n";
   auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(op);
   const char ukernelName[] = "query_tile_sizes.2d";
   if (!hasUkernel(targetAttr, ukernelName)) {
@@ -610,6 +741,7 @@ struct LowerToUKernelPattern : OpRewritePattern<OpType> {
 
   LogicalResult matchAndRewrite(OpType op,
                                 PatternRewriter &rewriter) const override {
+    //llvm::outs()<<"matchAndRewrite()\n";
     if (targetPredicate &&
         !targetPredicate(IREE::HAL::ExecutableTargetAttr::lookup(op))) {
       return failure();
@@ -633,6 +765,7 @@ struct LowerToUKernelPattern : OpRewritePattern<OpType> {
 } // namespace
 
 void CPULowerToUKernelsPass::runOnOperation() {
+  //llvm::outs()<<"CPULowerToUKernelPass::runOpOperation()\n";
   MLIRContext *context = &getContext();
   RewritePatternSet patterns(context);
   // Enabling a lowering of an op to a microkernel is a trade-off between the
@@ -649,6 +782,7 @@ void CPULowerToUKernelsPass::runOnOperation() {
   // these ops.
   auto allTargets = [](auto target) { return true; };
   patterns.insert<LowerToUKernelPattern<linalg::Mmt4DOp>,
+                  LowerToUKernelPattern<linalg::Conv2DNchwFchwOp>,
                   LowerToUKernelPattern<linalg::PackOp>,
                   LowerToUKernelPattern<linalg::UnPackOp>>(
       context, allTargets, skipIntermediateRoundings);

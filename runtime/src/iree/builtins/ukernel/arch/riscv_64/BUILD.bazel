@@ -21,6 +21,8 @@ package(
 UKERNEL_RISCV_64_INTERNAL_HEADERS = [
     "common_riscv_64.h",
     "general_riscv_64.h",
+    "mmt4d_riscv_64_internal.h",
+    "mmt4d_riscv_64_tiles.inl",
     "pack_riscv_64_internal.h",
     "unpack_riscv_64_internal.h",
 ]
@@ -41,6 +43,7 @@ iree_bitcode_library(
 iree_bitcode_library(
     name = "ukernel_bitcode_arch_riscv_64_v",
     srcs = [
+        "mmt4d_riscv_64_v.c",
         "pack_riscv_64_base.c",
         "unpack_riscv_64_base.c",
     ],

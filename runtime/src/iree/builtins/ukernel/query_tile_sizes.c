@@ -17,6 +17,17 @@ static bool iree_uk_query_tile_sizes_operation_is_matmul(
          op == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_MATMUL_BF16BF16BF16;
 }
 
+static bool iree_uk_query_tile_sizes_operation_is_conv(
+    iree_uk_uint32_t flags) {
+  iree_uk_uint32_t op = iree_uk_query_tile_sizes_operation(flags);
+  return op == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_CONV_F32F32F32 ||
+         op == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_CONV_I8I8I32 ||
+         op == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_CONV_F16F16F32 ||
+         op == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_CONV_F16F16F16 ||
+         op == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_CONV_BF16BF16F32 ||
+         op == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_CONV_BF16BF16BF16;
+}
+
 static void iree_uk_query_tile_sizes_2d_validate(
     const iree_uk_query_tile_sizes_2d_params_t* params) {
 #ifdef IREE_UK_ENABLE_ASSERTS
@@ -57,6 +68,41 @@ static void iree_uk_query_tile_sizes_2d_matmul(
   } else if (role == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_RESULT) {
     out_params->tile_size0 = matmul_tile_sizes.M;
     out_params->tile_size1 = matmul_tile_sizes.N;
+  } else {
+    // Shouldn't happen, validated earlier.
+  }
+}
+
+static iree_uk_conv_tile_sizes_t iree_uk_query_conv_tile_sizes_generic(
+    const iree_uk_query_tile_sizes_2d_params_t* params) {
+  // Dummy values, originally taken from what was used on ARM_64 +dotprod for
+  // i8i8i32. Not particularly meaningful outside of that case, just is what
+  // some tests have been written against.
+  (void)params;
+  return (iree_uk_conv_tile_sizes_t){.M = 8, .K = 4, .N = 8};
+}
+
+static void iree_uk_query_tile_sizes_2d_conv(
+    const iree_uk_query_tile_sizes_2d_params_t* params,
+    iree_uk_query_tile_sizes_2d_out_params_t* out_params) {
+  iree_uk_conv_tile_sizes_t conv_tile_sizes;
+  if (!iree_uk_query_conv_tile_sizes_arch(params, &conv_tile_sizes)) {
+    conv_tile_sizes = iree_uk_query_conv_tile_sizes_generic(params);
+  }
+  iree_uk_uint32_t role = iree_uk_query_tile_sizes_operand_role(params->flags);
+  if (role == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_LHS) {
+    // For conv, LHS is input: [N, C, H, W]
+    // We tile over output channels (M) and something else (K)
+    out_params->tile_size0 = conv_tile_sizes.M;
+    out_params->tile_size1 = conv_tile_sizes.K;
+  } else if (role == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_RHS) {
+    // For conv, RHS is weights: [OC, IC, KH, KW]
+    out_params->tile_size0 = conv_tile_sizes.N;
+    out_params->tile_size1 = conv_tile_sizes.K;
+  } else if (role == IREE_UK_FLAG_QUERY_TILE_SIZES_OPERAND_ROLE_RESULT) {
+    // For conv, result is output: [N, OC, OH, OW]
+    out_params->tile_size0 = conv_tile_sizes.M;
+    out_params->tile_size1 = conv_tile_sizes.N;
   } else {
     // Shouldn't happen, validated earlier.
   }
