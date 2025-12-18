@@ -42,7 +42,6 @@ void LowerUKernelOpsToCallsPass::runOnOperation() {
         FailureOr<mlir::CallOpInterface> callOp =
             microKernelOp.lowerToFunctionCall(rewriter);
         if (failed(callOp)) {
-          llvm::outs()<<"failed(callOp)\n";
           errorOp = microKernelOp;
           return WalkResult::interrupt();
         }
@@ -50,7 +49,6 @@ void LowerUKernelOpsToCallsPass::runOnOperation() {
         return WalkResult::advance();
       });
   if (result.wasInterrupted()) {
-    llvm::outs()<<"failed to lower micro kernel operation to function call\n";
     errorOp->emitOpError(
         "failed to lower micro kernel operation to function call");
     return signalPassFailure();

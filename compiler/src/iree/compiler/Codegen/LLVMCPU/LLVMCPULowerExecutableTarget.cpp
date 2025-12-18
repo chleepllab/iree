@@ -193,7 +193,6 @@ void LLVMCPULowerExecutableTargetPass::runOnOperation() {
     break;
   }
   default:
-    llvm::outs()<<"Unsupported pipeline on CPU target.\n";
     funcOp.emitOpError("Unsupported pipeline on CPU target.");
     return signalPassFailure();
   }

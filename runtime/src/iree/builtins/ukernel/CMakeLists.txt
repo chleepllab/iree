@@ -95,7 +95,7 @@ iree_cc_library(
     "conv_2d_nchw_fchw.c"
     "conv_2d_nchw_fchw.h"
     "conv_2d_nchw_fchw_internal.h"
-    "conv_2d_nchw_fchw_tile_generic.c"
+    "conv_2d_nchw_fchw_tile.c"
     "exported_bits.h"
     "mmt4d.c"
     "mmt4d.h"
@@ -131,7 +131,7 @@ iree_bitcode_library(
     "internal_headers_filegroup.stamp"
   SRCS
     "conv_2d_nchw_fchw.c"
-    "conv_2d_nchw_fchw_tile_generic.c"
+    "conv_2d_nchw_fchw_tile.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"
     "pack.c"
@@ -150,7 +150,7 @@ iree_bitcode_library(
     "internal_headers_filegroup.stamp"
   SRCS
     "conv_2d_nchw_fchw.c"
-    "conv_2d_nchw_fchw_tile_generic.c"
+    "conv_2d_nchw_fchw_tile.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"
     "pack.c"
@@ -169,7 +169,7 @@ iree_bitcode_library(
     "internal_headers_filegroup.stamp"
   SRCS
     "conv_2d_nchw_fchw.c"
-    "conv_2d_nchw_fchw_tile_generic.c"
+    "conv_2d_nchw_fchw_tile.c"
     "fallback.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"
@@ -189,7 +189,7 @@ iree_bitcode_library(
     "internal_headers_filegroup.stamp"
   SRCS
     "conv_2d_nchw_fchw.c"
-    "conv_2d_nchw_fchw_tile_generic.c"
+    "conv_2d_nchw_fchw_tile.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"
     "pack.c"
@@ -208,7 +208,7 @@ iree_bitcode_library(
     "internal_headers_filegroup.stamp"
   SRCS
     "conv_2d_nchw_fchw.c"
-    "conv_2d_nchw_fchw_tile_generic.c"
+    "conv_2d_nchw_fchw_tile.c"
     "fallback.c"
     "mmt4d.c"
     "mmt4d_tile_generic.c"

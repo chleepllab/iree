@@ -68,7 +68,7 @@ iree_runtime_cc_library(
         "unpack.c",
         "unpack_tile.c",
         "conv_2d_nchw_fchw.c",
-        "conv_2d_nchw_fchw_tile_generic.c",
+        "conv_2d_nchw_fchw_tile.c",
     ] + internal_headers,
     hdrs = ["api.h"],
     deps = [
@@ -123,7 +123,7 @@ bitcode_specific_archs = [
         "unpack.c",
         "unpack_tile.c",
         "conv_2d_nchw_fchw.c",
-        "conv_2d_nchw_fchw_tile_generic.c",
+        "conv_2d_nchw_fchw_tile.c",
     ] + ([] if arch in bitcode_specific_archs else ["fallback.c"]),
     arch = arch,
     internal_hdrs = [

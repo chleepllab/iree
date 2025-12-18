@@ -288,7 +288,7 @@ struct ConvertConv2DNchwFchwPattern
 
   LogicalResult matchAndRewrite(linalg::Conv2DNchwFchwOp op,
                                 PatternRewriter &rewriter) const override {
-    //llvm::outs()<<"ConvertConv2DNchwFchwPattern::matchAndRewrite()\n";
+    llvm::outs()<<"ConvertConv2DNchwFchwPattern::matchAndRewrite()\n";
     auto input = op.getDpsInputOperand(0)->get();
     auto filter = op.getDpsInputOperand(1)->get();
     auto output = op.getDpsInitOperand(0)->get();
@@ -375,7 +375,7 @@ struct Convert3DPackto2DPackPattern : public OpRewritePattern<linalg::PackOp> {
 
   LogicalResult matchAndRewrite(linalg::PackOp packOp,
                                 PatternRewriter &rewriter) const override {
-    //llvm::outs()<<"Convert3DPackto2DPackPattern::matchAndRewrite()\n";
+    llvm::outs()<<"Convert3DPackto2DPackPattern::matchAndRewrite()\n";
     if (packOp.getSourceRank() != 3 || packOp.getDestRank() != 5) {
       return failure();
     }
@@ -531,7 +531,7 @@ struct CPUPrepareUkernelsPass
 } // namespace
 
 void CPUPrepareUkernelsPass::runOnOperation() {
-  //llvm::outs()<<"CPUPrepareUkernelsPass::runOnOperation()\n";
+  llvm::outs()<<"CPUPrepareUkernelsPass::runOnOperation()\n";
   MLIRContext *ctx = &getContext();
   RewritePatternSet patterns(ctx);
   auto funcOp = getOperation();

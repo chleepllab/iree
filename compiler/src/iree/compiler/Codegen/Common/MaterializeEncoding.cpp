@@ -172,7 +172,7 @@ getFuncExecutableTargetAttrs(FunctionOpInterface funcOp,
 struct MaterializeHostEncodingPass final
     : impl::MaterializeHostEncodingPassBase<MaterializeHostEncodingPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
-    llvm::outs()<<"MaterializeHostEncodingPass::getDependentDialects()\n";
+    //llvm::outs()<<"MaterializeHostEncodingPass::getDependentDialects()\n";
     registry.insert<arith::ArithDialect, tensor::TensorDialect,
                     IREE::Codegen::IREECodegenDialect,
                     IREE::CPU::IREECPUDialect, IREE::GPU::IREEGPUDialect>();
@@ -236,7 +236,7 @@ struct MaterializeDeviceEncodingPass final
   using Base::Base;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    llvm::outs()<<"MaterializeDeviceEncodingPass::getDependentDialects()\n";
+    //llvm::outs()<<"MaterializeDeviceEncodingPass::getDependentDialects()\n";
     registry.insert<arith::ArithDialect, tensor::TensorDialect,
                     IREE::Codegen::IREECodegenDialect,
                     IREE::CPU::IREECPUDialect, IREE::GPU::IREEGPUDialect>();

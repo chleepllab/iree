@@ -17,12 +17,14 @@ iree_bitcode_library(
     riscv_64
   INTERNAL_HDRS
     "common_riscv_64.h"
+    "conv_2d_nchw_fchw_riscv_64_internal.h"
     "general_riscv_64.h"
     "mmt4d_riscv_64_internal.h"
     "mmt4d_riscv_64_tiles.inl"
     "pack_riscv_64_internal.h"
     "unpack_riscv_64_internal.h"
   SRCS
+    "conv_2d_nchw_fchw_riscv_64_entry_point.c"
     "mmt4d_riscv_64_entry_point.c"
     "pack_riscv_64_entry_point.c"
     "query_tile_sizes_riscv_64_entry_point.c"
@@ -38,12 +40,14 @@ iree_bitcode_library(
     riscv_64
   INTERNAL_HDRS
     "common_riscv_64.h"
+    "conv_2d_nchw_fchw_riscv_64_internal.h"
     "general_riscv_64.h"
     "mmt4d_riscv_64_internal.h"
     "mmt4d_riscv_64_tiles.inl"
     "pack_riscv_64_internal.h"
     "unpack_riscv_64_internal.h"
   SRCS
+    "conv_2d_nchw_fchw_riscv_64_base.c"
     "mmt4d_riscv_64_v.c"
     "pack_riscv_64_base.c"
     "unpack_riscv_64_base.c"
@@ -91,6 +95,7 @@ iree_cc_library(
   NAME
     riscv_64_v
   SRCS
+    "conv_2d_nchw_fchw_riscv_64_base.c"
     "mmt4d_riscv_64_v.c"
     "pack_riscv_64_base.c"
     "unpack_riscv_64_base.c"
@@ -106,6 +111,7 @@ endif()  # IREE_UK_BUILD_RISCV_64_V
 iree_cc_library(
   NAME riscv_64
   SRCS
+    "conv_2d_nchw_fchw_riscv_64_entry_point.c"
     "mmt4d_riscv_64_entry_point.c"
     "pack_riscv_64_entry_point.c"
     "unpack_riscv_64_entry_point.c"

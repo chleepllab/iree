@@ -14,21 +14,10 @@
 typedef struct iree_uk_conv_params_t {
   const void* lhs_buffer;
   iree_uk_index_t lhs_offset;
-  iree_uk_index_t lhs_stride0;
-  iree_uk_index_t lhs_stride1;
-  iree_uk_index_t lhs_stride2;
-  iree_uk_index_t lhs_stride3;
   const void* rhs_buffer;
   iree_uk_index_t rhs_offset;
-  iree_uk_index_t rhs_stride0;
-  iree_uk_index_t rhs_stride1;
-  iree_uk_index_t rhs_stride2;
-  iree_uk_index_t rhs_stride3;
   void* out_buffer;
   iree_uk_index_t out_offset;
-  iree_uk_index_t out_stride0;
-  iree_uk_index_t out_stride1;
-  iree_uk_index_t out_stride2;
   iree_uk_index_t batch_count;
   iree_uk_index_t input_channel_count;
   iree_uk_index_t output_channel_count;
@@ -38,26 +27,14 @@ typedef struct iree_uk_conv_params_t {
   iree_uk_index_t kernel_width;
   iree_uk_index_t output_height;
   iree_uk_index_t output_width;
-  iree_uk_index_t stride_height;
-  iree_uk_index_t stride_width;
-  iree_uk_index_t dilation_height;
-  iree_uk_index_t dilation_width;
-  iree_uk_index_t padding_top;
-  iree_uk_index_t padding_bottom;
-  iree_uk_index_t padding_left;
-  iree_uk_index_t padding_right;
-  iree_uk_int32_t M0;
-  iree_uk_int32_t N0;
-  iree_uk_int32_t K0;
+  iree_uk_index_t tile_size0;
+  iree_uk_index_t tile_size1;
   iree_uk_uint32_t flags;
   const iree_uk_uint64_t* cpu_data;
 } iree_uk_conv_params_t;
 
 // Same as the iree_uk_conv public entry point, but taking the struct.
 void iree_uk_conv_p(const iree_uk_conv_params_t* params);
-
-// Same as the iree_uk_conv_info public entry point, but taking the struct.
-iree_uk_uint32_t iree_uk_conv_info_p(const iree_uk_conv_params_t* params);
 
 typedef enum iree_uk_conv_type_t {
   iree_uk_conv_type_f32f32f32 =
@@ -124,26 +101,27 @@ static inline iree_uk_type_t iree_uk_conv_out_type(iree_uk_conv_type_t type) {
 
 // Function pointer type for tile functions
 typedef void (*iree_uk_conv_tile_func_t)(
-    void* IREE_UK_RESTRICT out_tile, const void* IREE_UK_RESTRICT lhs_panel,
-    const void* IREE_UK_RESTRICT rhs_panel,
-    const iree_uk_conv_params_t* params, iree_uk_int32_t tile_M0,
-    iree_uk_int32_t tile_N0);
+    void* IREE_UK_RESTRICT out_tile_ptr,
+    const void* IREE_UK_RESTRICT in_tile_ptr, const void* IREE_UK_RESTRICT kernel_tile_ptr,
+    iree_uk_index_t in_size0, iree_uk_index_t in_size1,
+    iree_uk_index_t kernel_size0, iree_uk_index_t kernel_size1,
+    iree_uk_index_t outer_size0, iree_uk_index_t outer_size1,
+    iree_uk_index_t tile_size0, iree_uk_index_t tile_size1,
+    iree_uk_index_t elem_size);
 
 // Tile kernel declarations
-#define IREE_UK_CONV_TILE_FUNC_DECL(NAME)          \
-  void NAME(void* IREE_UK_RESTRICT out_tile,        \
-            const void* IREE_UK_RESTRICT lhs_panel, \
-            const void* IREE_UK_RESTRICT rhs_panel, \
-            const iree_uk_conv_params_t* params,   \
-            iree_uk_int32_t tile_M0,               \
-            iree_uk_int32_t tile_N0);
+#define IREE_UK_CONV_TILE_FUNC_DECL(NAME)                             \
+  void NAME(void* IREE_UK_RESTRICT out_tile_ptr,                      \
+            const void* IREE_UK_RESTRICT in_tile_ptr,                 \
+            const void* IREE_UK_RESTRICT kernel_tile_ptr,             \
+            iree_uk_index_t in_size0, iree_uk_index_t in_size1,       \
+            iree_uk_index_t kernel_size0, iree_uk_index_t kernel_size1, \
+            iree_uk_index_t outer_size0, iree_uk_index_t outer_size1,   \
+            iree_uk_index_t tile_size0, iree_uk_index_t tile_size1,     \
+            iree_uk_index_t elem_size);
 
 // Architecture-specific implementation, or generic fallback returning null.
 iree_uk_conv_tile_func_t iree_uk_conv_2d_nchw_fchw_select_tile_func_arch(
-    const iree_uk_conv_params_t* params);
-
-// Generic fallback.
-iree_uk_conv_tile_func_t iree_uk_conv_2d_nchw_fchw_select_tile_func_generic(
     const iree_uk_conv_params_t* params);
 
 #endif  // IREE_BUILTINS_UKERNEL_CONV_INTERNAL_H_
