@@ -23,6 +23,8 @@ typedef struct iree_uk_test_t iree_uk_test_t;
 // first argument to `test_func`. This is done as a second separate call to
 // `test_func` so that we maintain test coverage for the fallback logic and
 // baseline kernels used when CPU features are unavailable.
+void iree_uk_test_log_info(const iree_uk_test_t* test, const char* emoji,
+                                  const char* msg);
 void iree_uk_test(const char* name,
                   void (*test_func)(iree_uk_test_t*, const void*),
                   const void* params, const char* cpu_features);

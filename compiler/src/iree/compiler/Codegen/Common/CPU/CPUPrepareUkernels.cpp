@@ -24,10 +24,12 @@ using IREE::Codegen::LoweringConfigAttr;
 static void tileBatchDimsForBatchMmt4dOp(RewriterBase &rewriter,
                                          FunctionOpInterface funcOp) {
   funcOp.walk([&](linalg::BatchMmt4DOp batchMmt4DOp) {
+    llvm::outs()<<"!!!rewriter.replaceOp() in tileBatchDimsForBatchMmt4dOp\n";
     auto out = batchMmt4DOp.getDpsInitOperand(0)->get();
     auto outType = cast<RankedTensorType>(out.getType());
     // Tile only non unit batch dimensions with tile size equals to 1.
     if (outType.getShape()[0] <= 1) {
+      llvm::outs()<<"return earlier: outShape:"<<outType.getShape()[0]<<"\n";
       return;
     }
     SmallVector<OpFoldResult> tileSizes = {rewriter.getIndexAttr(1)};
@@ -47,38 +49,38 @@ static void tileBatchDimsForBatchMmt4dOp(RewriterBase &rewriter,
 static void tileBatchDimsForConvOps(RewriterBase &rewriter,
                                     FunctionOpInterface funcOp) {
   funcOp.walk([&](linalg::Conv2DNchwFchwOp convOp) {
-    auto out = convOp.getDpsInitOperand(0)->get();
-    auto outType = cast<RankedTensorType>(out.getType());
+    //auto out = convOp.getDpsInitOperand(0)->get();
+    //auto outType = cast<RankedTensorType>(out.getType());
+    return;
 
-    // Only tile non-unit batch dimensions with tile size equals to 1.
-    if (outType.getShape()[0] <= 1) {
-      return;
-    }
-
-    SmallVector<OpFoldResult> tileSizes = {rewriter.getIndexAttr(1)};
-    // Add zeros for other dimensions to keep them unchanged
-    for (int i = 1; i < outType.getRank(); ++i) {
-      tileSizes.push_back(rewriter.getIndexAttr(0));
-    }
+    //OpFoldResult zero = rewriter.getIndexAttr(0);
+    //OpFoldResult one = rewriter.getIndexAttr(1);
+    SmallVector<OpFoldResult> tileSizes = {
+        rewriter.getIndexAttr(0),
+        rewriter.getIndexAttr(0),
+        rewriter.getIndexAttr(8),
+        rewriter.getIndexAttr(8),
+        rewriter.getIndexAttr(0),
+        rewriter.getIndexAttr(0),
+        rewriter.getIndexAttr(0)
+    };
 
     auto tilingInterfaceOp = cast<TilingInterface>(convOp.getOperation());
-    auto options = scf::SCFTileAndFuseOptions().setTilingOptions(
-        scf::SCFTilingOptions().setTileSizes(tileSizes));
-    FailureOr<scf::SCFTileAndFuseResult> tileAndFuseResult =
-        scf::tileConsumerAndFuseProducersUsingSCF(rewriter, tilingInterfaceOp,
-                                                  options);
-    if (succeeded(tileAndFuseResult)) {
-      rewriter.replaceOp(
-          convOp,
-          tileAndFuseResult->replacements[convOp.getResult(0)]);
-    }
+    auto options = scf::SCFTilingOptions().setTileSizes(tileSizes);
+    FailureOr<scf::SCFTilingResult> tilingResult =
+        scf::tileUsingSCF(rewriter, tilingInterfaceOp, options);
+    assert(succeeded(tilingResult));
+    llvm::outs()<<"rewriter.replaceOp() in tileBatchDimsForConvOps\n";
+    rewriter.replaceOp(convOp, tilingResult->replacements);
   });
 }
 
 static void tileNonPackedDimsFor3DPackOps(RewriterBase &rewriter,
                                           FunctionOpInterface funcOp) {
   funcOp.walk([&](linalg::PackOp packOp) {
+    llvm::outs()<<"rewriter.replaceOp() in tileNonPackedDimsFor3DPackOps\n";
     if (packOp.getSourceRank() != 3 || packOp.getDestRank() != 5) {
+      llvm::outs()<<"return earlier: sourceRank:"<<packOp.getSourceRank()<<" destRank:"<<packOp.getDestRank()<<"\n";
       return;
     }
 
@@ -206,6 +208,7 @@ struct ConvertBatchMmt4DtoMmt4DPattern
 
   LogicalResult matchAndRewrite(linalg::BatchMmt4DOp op,
                                 PatternRewriter &rewriter) const override {
+    llvm::outs()<<"!!!ConvertBatchMmt4DtoMmt4DPattern::matchAndRewrite()\n";
     auto loc = op.getLoc();
     auto lhs = op.getDpsInputOperand(0)->get();
     auto rhs = op.getDpsInputOperand(1)->get();
@@ -288,6 +291,7 @@ struct ConvertConv2DNchwFchwPattern
 
   LogicalResult matchAndRewrite(linalg::Conv2DNchwFchwOp op,
                                 PatternRewriter &rewriter) const override {
+    return failure();
     llvm::outs()<<"ConvertConv2DNchwFchwPattern::matchAndRewrite()\n";
     auto input = op.getDpsInputOperand(0)->get();
     auto filter = op.getDpsInputOperand(1)->get();
@@ -375,8 +379,8 @@ struct Convert3DPackto2DPackPattern : public OpRewritePattern<linalg::PackOp> {
 
   LogicalResult matchAndRewrite(linalg::PackOp packOp,
                                 PatternRewriter &rewriter) const override {
-    llvm::outs()<<"Convert3DPackto2DPackPattern::matchAndRewrite()\n";
     if (packOp.getSourceRank() != 3 || packOp.getDestRank() != 5) {
+      llvm::outs()<<"return earlier: Convert3DPackto2DPackPattern::matchAndRewrite()\n";
       return failure();
     }
 

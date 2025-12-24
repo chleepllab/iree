@@ -11,14 +11,17 @@
 
 // `conv` microkernel for 2D convolution with NCHW input and FCHW filter layout.
 IREE_UK_EXPORT void iree_uk_conv_2d_nchw_fchw(
-    const void* lhs_buffer, iree_uk_index_t lhs_offset,
-    const void* rhs_buffer, iree_uk_index_t rhs_offset,
+    const void* in_buffer, iree_uk_index_t in_offset,
+    iree_uk_index_t in_stride0, iree_uk_index_t in_stride1,
+    const void* filter_buffer, iree_uk_index_t filter_offset,
+    iree_uk_index_t filter_stride0, iree_uk_index_t filter_stride1,
     void* out_buffer, iree_uk_index_t out_offset,
-    iree_uk_index_t batch_count, iree_uk_index_t input_channel_count,
-    iree_uk_index_t output_channel_count,
-    iree_uk_index_t input_height, iree_uk_index_t input_width,
-    iree_uk_index_t kernel_height, iree_uk_index_t kernel_width,
-    iree_uk_index_t output_height, iree_uk_index_t output_width,
+    iree_uk_index_t out_stride0, iree_uk_index_t out_stride1,
+    iree_uk_index_t out_size_n,
+    iree_uk_index_t in_size_c, iree_uk_index_t out_size_c,
+    iree_uk_index_t in_size_h, iree_uk_index_t in_size_w,
+    iree_uk_index_t filter_size_h, iree_uk_index_t filter_size_w,
+    iree_uk_index_t out_size_h, iree_uk_index_t out_size_w,
     iree_uk_index_t tile_size0, iree_uk_index_t tile_size1,
     iree_uk_uint32_t flags, const iree_uk_uint64_t* cpu_data);
 

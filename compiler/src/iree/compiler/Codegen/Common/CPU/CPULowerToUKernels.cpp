@@ -169,6 +169,7 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Mmt4DOp op,
   if (!hasUkernel(targetAttr, ukernelName)) {
     return failure();
   }
+  llvm::outs()<<"matchDAGForUKernel Mmt4DOp\n";
   Value lhs = getInputForUKernel(op.getDpsInputOperand(0)->get());
   Value rhs = getInputForUKernel(op.getDpsInputOperand(1)->get());
   Value out = op.getDpsInitOperand(0)->get();
@@ -268,24 +269,21 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Mmt4DOp op,
 static FailureOr<IREE::Codegen::UKernelOpInterface>
 matchDAGForUKernel(RewriterBase &rewriter, linalg::Conv2DNchwFchwOp op,
                    bool /*skipIntermediateRoundings*/) {
-  llvm::outs()<<"matchDAGForUKernel Conv2D\n";
   auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(op);
   const char ukernelName[] = "conv_2d_nchw_fchw";
-  //if (!hasUkernel(targetAttr, ukernelName)) {
-  //  return failure();
-  //}
-  Value lhs = getInputForUKernel(op.getDpsInputOperand(0)->get());
-  Value rhs = getInputForUKernel(op.getDpsInputOperand(1)->get());
+  if (!hasUkernel(targetAttr, ukernelName)) {
+    return failure();
+  }
+  llvm::outs()<<"matchDAGForUKernel Conv2D\n";
+  Value lhs = op.getDpsInputOperand(0)->get();
+  Value rhs = op.getDpsInputOperand(1)->get();
   Value out = op.getDpsInitOperand(0)->get();
-  //Value lhs = op.getImage();
-  //Value rhs = op.getFilter();
-  //Value out = op.getOutput();
   auto inType = llvm::cast<ShapedType>(lhs.getType());
   auto filterType = llvm::cast<ShapedType>(rhs.getType());
   auto outType = llvm::cast<ShapedType>(out.getType());
-  Type inElemType = inputType.getElementType();
+  Type inElemType = inType.getElementType();
   Type filterElemType = filterType.getElementType();
-  Type outElemType = outputType.getElementType();
+  Type outElemType = outType.getElementType();
   uint32_t flags = 0;
   if (inElemType.isF32() && filterElemType.isF32() && outElemType.isF32()) {
     flags = IREE_UK_FLAG_CONV_TYPE_F32F32F32;
@@ -316,37 +314,37 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Conv2DNchwFchwOp op,
   }
 
   Location loc = op.getLoc();
-  Value batch_count = rewriter.create<tensor::DimOp>(loc, lhs, 0);      // N
-  Value input_channel_count = rewriter.create<tensor::DimOp>(loc, lhs, 1); // C
-  Value input_height = rewriter.create<tensor::DimOp>(loc, lhs, 2);     // H
-  Value input_width = rewriter.create<tensor::DimOp>(loc, lhs, 3);      // W
-  Value output_channel_count = rewriter.create<tensor::DimOp>(loc, rhs, 0); // F
-  Value kernel_height = rewriter.create<tensor::DimOp>(loc, rhs, 2);    // KH
-  Value kernel_width = rewriter.create<tensor::DimOp>(loc, rhs, 3);     // KW
-  Value output_height = rewriter.create<tensor::DimOp>(loc, out, 2);
-  Value output_width = rewriter.create<tensor::DimOp>(loc, out, 3);
+  Value out_size_n = rewriter.create<tensor::DimOp>(loc, lhs, 0);
+  Value in_size_c = rewriter.create<tensor::DimOp>(loc, lhs, 1);
+  Value in_size_h = rewriter.create<tensor::DimOp>(loc, lhs, 2);
+  Value in_size_w = rewriter.create<tensor::DimOp>(loc, lhs, 3);
+  Value out_size_c = rewriter.create<tensor::DimOp>(loc, rhs, 0);
+  Value filter_size_h = rewriter.create<tensor::DimOp>(loc, rhs, 2);
+  Value filter_size_w = rewriter.create<tensor::DimOp>(loc, rhs, 3);
+  Value out_size_h = rewriter.create<tensor::DimOp>(loc, out, 2);
+  Value out_size_w = rewriter.create<tensor::DimOp>(loc, out, 3);
   Value tile_size0 = rewriter.create<tensor::DimOp>(loc, rhs, 2);
   Value tile_size1 = rewriter.create<tensor::DimOp>(loc, rhs, 3);
   Value flagsVal = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getI32IntegerAttr(flags));
   auto fn = getFnNameAndDefAttrs(ukernelName, rewriter, targetAttr);
   SmallVector<Type> returnTypes =
-      getUKernelGenericReturnTypes(targetAttr, outputType);
+      getUKernelGenericReturnTypes(targetAttr, outType);
   auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
       loc, returnTypes, fn.name, ValueRange{lhs, rhs}, out,
       ValueRange{
-          batch_count,           // batch_count
-          input_channel_count,   // input_channel_count
-          output_channel_count,  // output_channel_count
-          input_height,          // input_height
-          input_width,           // input_width
-          kernel_height,         // kernel_height
-          kernel_width,          // kernel_width
-          output_height,     // output_height
-          output_width,      // output_width
-          tile_size0,            // tile_size0
-          tile_size1,            // tile_size1
-          flagsVal               // flags
+          out_size_n,
+          in_size_c,
+          out_size_c,
+          in_size_h,
+          in_size_w,
+          filter_size_h,
+          filter_size_w,
+          out_size_h,
+          out_size_w,
+          tile_size0,
+          tile_size1,
+          flagsVal
       },
       /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
       /*strided_outer_dims=*/rewriter.getIndexAttr(2));
@@ -362,6 +360,7 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::PackOp op,
   if (!hasUkernel(targetAttr, ukernelName)) {
     return failure();
   }
+  llvm::outs()<<"matchDAGForUKernel PackOp\n";
   Value in = op.getSource();
   Value out = op.getDest();
   auto inType = llvm::cast<ShapedType>(in.getType());
@@ -714,6 +713,7 @@ struct LowerToUKernelPattern : OpRewritePattern<OpType> {
     SmallVector<Value> results = ukernelOp.value()->getResults();
     results.truncate(op->getNumResults());
     rewriter.replaceOp(op, results);
+    llvm::outs()<<"matchAndRewrite() success\n";
     return success();
   }
 

@@ -29,6 +29,7 @@ if(_IREE_UKERNEL_BITCODE_BUILD_ARM_64)
 UKERNEL_ARM_64_INTERNAL_HEADERS = [
     "common_arm_64.h",
     "mmt4d_arm_64_internal.h",
+    "conv_2d_nchw_fchw_arm_64_internal.h",
     "mmt4d_arm_64_tiles.inl",
     "pack_arm_64_internal.h",
     "unpack_arm_64_internal.h",
@@ -40,6 +41,7 @@ iree_bitcode_library(
     name = "ukernel_bitcode_arch_arm_64_entry_points",
     srcs = [
         "mmt4d_arm_64_entry_point.c",
+        "conv_2d_nchw_fchw_arm_64_entry_point.c",
         "pack_arm_64_entry_point.c",
         "unpack_arm_64_entry_point.c",
     ],

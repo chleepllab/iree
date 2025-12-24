@@ -72,7 +72,7 @@ static void iree_uk_test_log_status(const iree_uk_test_t* test) {
 }
 
 // Log an info message.
-static void iree_uk_test_log_info(const iree_uk_test_t* test, const char* emoji,
+void iree_uk_test_log_info(const iree_uk_test_t* test, const char* emoji,
                                   const char* msg) {
   fprintf(stderr, "[   INFO   ] %s %s\n", emoji, msg);
 }

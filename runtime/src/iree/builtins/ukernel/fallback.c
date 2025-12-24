@@ -31,7 +31,7 @@ bool iree_uk_query_matmul_tile_sizes_arch(
   return false;
 }
 
-iree_uk_conv_tile_func_t iree_uk_conv_2d_nchw_fchw_select_tile_func_arch(
+iree_uk_conv_2d_nchw_fchw_tile_func_t iree_uk_conv_2d_nchw_fchw_select_tile_func_arch(
     const iree_uk_conv_params_t* params) {
   return 0;
 }
