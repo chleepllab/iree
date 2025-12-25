@@ -2647,6 +2647,7 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
 static LogicalResult
 setRootConfigImpl(mlir::FunctionOpInterface entryPointFn, Operation *op,
                   const TargetMLTransformInfo &targetMLTransInfo) {
+  llvm::outs()<<"setRootConfigImpl()\n";
   auto setRootConfigFn = [&](Operation *op) -> LogicalResult {
     return TypeSwitch<Operation *, LogicalResult>(op)
         .Case<linalg::GenericOp>([&](auto op) {
@@ -2660,7 +2661,7 @@ setRootConfigImpl(mlir::FunctionOpInterface entryPointFn, Operation *op,
         .Case<IREE::LinalgExt::AttentionOp, IREE::LinalgExt::FftOp,
               linalg::PackOp, tensor::PadOp, linalg::UnPackOp, linalg::Mmt4DOp,
               linalg::BatchMmt4DOp>(
-            [&](auto op) { return setRootConfig(entryPointFn, op); })
+            [&](auto op) { llvm::outs()<<"!case Pack,Unpack,Mmt4d\n";return setRootConfig(entryPointFn, op); })
         .Case<IREE::LinalgExt::WinogradFilterTransformOp,
               IREE::LinalgExt::WinogradInputTransformOp,
               IREE::LinalgExt::WinogradOutputTransformOp>(
@@ -2674,10 +2675,10 @@ setRootConfigImpl(mlir::FunctionOpInterface entryPointFn, Operation *op,
               return setConvInterfaceRootConfig(entryPointFn, op);
             })
         .Case<linalg::ContractionOpInterface>(
-            [&](auto op) { return setRootConfig(entryPointFn, op); })
+            [&](auto op) { llvm::outs()<<"!case Contraction\n";return setRootConfig(entryPointFn, op); })
         .Case<TilingInterface>(
             [&](auto op) { return setRootConfig(entryPointFn, op); })
-        .Default([&](Operation *op) { return success(); });
+        .Default([&](Operation *op) { llvm::outs()<<"case Default.\n";return success(); });
   };
   return setRootConfigFn(op);
 }

@@ -57,6 +57,7 @@ verifyLoweringConfiguration(FunctionOpInterface funcOp,
 }
 
 void LLVMCPUSelectLoweringStrategyPass::runOnOperation() {
+  llvm::outs()<<"LLVMCPUSelectLoweringStrategyPass::runOnOperation()\n";
   auto moduleOp = getOperation();
   for (auto funcOp : moduleOp.getOps<FunctionOpInterface>()) {
     // Set the strategy with default heuristics.
@@ -72,17 +73,21 @@ void LLVMCPUSelectLoweringStrategyPass::runOnOperation() {
 
     // Verify the configuration.
     LogicalResult verificationStatus = success();
+    llvm::outs()<<"select configuration.\n";
     switch (translationInfo.getDispatchLoweringPassPipeline()) {
     case IREE::Codegen::DispatchLoweringPassPipeline::CPUDoubleTilingExpert:
+      llvm::outs()<<"select CPUDoubleTilingExpert.\n";
       verificationStatus = verifyLoweringConfiguration(
           funcOp, translationInfo, verifyDoubleTilingExpertPassPipelineConfig);
       break;
     case IREE::Codegen::DispatchLoweringPassPipeline::
         CPUConvTileAndDecomposeExpert:
+      llvm::outs()<<"select CPUConvTileAndDecomposeExpert.\n";
       verificationStatus = verifyLoweringConfiguration(
           funcOp, translationInfo, verifyConvTileAndDecomposeExpertConfig);
       break;
     default:
+      llvm::outs()<<"select Nothing.\n";
       break;
     }
     if (failed(verificationStatus)) {

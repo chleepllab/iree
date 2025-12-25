@@ -546,11 +546,11 @@ void CPUPrepareUkernelsPass::runOnOperation() {
     tileBatchDimsForBatchMmt4dOp(rewriter, funcOp);
     patterns.add<ConvertBatchMmt4DtoMmt4DPattern>(ctx);
   }
-  if (hasUkernel(targetAttr, "conv_2d_nchw_fchw")) {
+  /*if (hasUkernel(targetAttr, "conv_2d_nchw_fchw")) {
     //llvm::outs()<<"conv_2d_nchw_fchw hasUkernel\n";
     tileBatchDimsForConvOps(rewriter, funcOp);
     patterns.add<ConvertConv2DNchwFchwPattern>(ctx);
-  }
+  }*/
   if (hasUkernel(targetAttr, "pack")) {
     tileNonPackedDimsFor3DPackOps(rewriter, funcOp);
     patterns.add<Convert3DPackto2DPackPattern>(ctx);
