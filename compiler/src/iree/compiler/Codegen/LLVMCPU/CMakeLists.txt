@@ -81,6 +81,8 @@ iree_cc_library(
     "Utils.cpp"
     "VectorContractCustomKernels.cpp"
     "VerifyLinalgTransformLegality.cpp"
+  COPTS
+    "-DMY_PASS"
   DEPS
     ::PassHeaders
     ::PassesIncGen

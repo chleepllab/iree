@@ -49,6 +49,8 @@ iree_cc_library(
     "SplitReduction.cpp"
     "TensorPadToTensorInsertSlice.cpp"
     "TransposeGenericOps.cpp"
+  COPTS
+    "-DMY_FUSION"
   DEPS
     ::PassHeaders
     ::PassesIncGen

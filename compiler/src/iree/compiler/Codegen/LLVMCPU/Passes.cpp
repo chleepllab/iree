@@ -74,6 +74,12 @@ addTileAndDistributePasses(OpPassManager &funcPassManager,
   if (pipelineOpt.cpuOpts.disableDistribution) {
     return;
   }
+#ifdef MY_PASS
+  funcPassManager.addPass(createRewriteConvChainAsForallPass());
+  funcPassManager.addPass(createRewriteConvMaxpoolAsForallPass());
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+#endif
   funcPassManager.addPass(
       createTileAndDistributeToWorkgroupsUsingForallOpPass());
   funcPassManager.addPass(createBufferizeDispatchTensorLoadStorePass());
@@ -218,6 +224,33 @@ void addMultiTilingExpertPassPipeline(
       IREE::CPU::TilingLevel::VectorInnerParallelTiles));
   funcPassManager.addPass(createFuseTensorPadWithConsumerPass());
   funcPassManager.addPass(createConcretizePadResultShapePass());
+
+#ifdef MY_PASS
+  // The conv-chain / conv-maxpool rewrites (see addTileAndDistributePasses)
+  // leave convolution generics inside a dispatch that KernelDispatch typed as
+  // DoubleTilingExpert, so this pipeline -- not ConvTileAndDecomposeExpert --
+  // is what lowers them. Once the window dims are tiled to 1 above, those
+  // generics still carry non-projected-permutation activation maps
+  // (`d1 + d4`), which linalg vectorization refuses, leaving the conv as a
+  // scalar loop nest. Decomposing them to their lower-dim form (exactly what
+  // the conv pipeline does at this point) drops the unit window dims and turns
+  // each conv into a contraction the vectorizer lowers to vector.contract.
+  // The pass returns immediately when the function holds no convolution, so
+  // this is a no-op for every other DoubleTilingExpert dispatch.
+  //
+  // Decomposition only fires on a conv whose H dims are already unit
+  // (kh == oh == 1). The reduction level above is tiled for non-root ops
+  // (`skipRootOp=true` above), but the parallel levels are only tiled through
+  // the root op and its fusion chain -- which leaves the *producer* conv of a
+  // fused chain with its full oh extent, hence undecomposed and unvectorized.
+  // Tile the non-root ops' parallel dims too so both convs of the chain reach
+  // the decomposition in the same shape.
+  funcPassManager.addPass(createLLVMCPUTilePass(
+      IREE::CPU::TilingLevel::VectorCommonParallelTiles, /*skipRootOp=*/true));
+  funcPassManager.addPass(createDecomposeConvolutionToLowerDimOpsPass());
+  funcPassManager.addPass(createFuseTensorPadWithConsumerPass());
+  funcPassManager.addPass(createConcretizePadResultShapePass());
+#endif
 
   funcPassManager.addPass(createForallToForPass());
   if (pipelineOpt.enablePeeling) {

@@ -61,6 +61,80 @@ using IREE::LinalgExt::getRootParallelLoopToOpMap;
 // Root and fusion group handling
 //===----------------------------------------------------------------------===//
 
+#ifdef MY_FUSION
+static constexpr StringLiteral kSpecialFusionAttr =
+    "iree_dispatch.special_conv_chain";
+
+static bool isMaxPoolLikeGeneric(linalg::GenericOp op) {
+  if (!op) return false;
+  if (op.getNumReductionLoops() != 2) return false;
+  if (op.getNumDpsInputs() != 2) return false;
+  if (op.getNumResults() != 1) return false;
+
+  auto input0Type = dyn_cast<RankedTensorType>(op.getDpsInputs()[0].getType());
+  auto input1Type = dyn_cast<RankedTensorType>(op.getDpsInputs()[1].getType());
+  auto resultType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
+  if (!input0Type || !input1Type || !resultType) return false;
+
+  // Typical maxpool generic:
+  //   input0: CxHxW or NxCxHxW
+  //   input1: KxK window tensor (e.g. 3x3)
+  //   result: same rank as input0
+  if (input1Type.getRank() != 2) return false;
+  if (input0Type.getRank() != resultType.getRank()) return false;
+
+  return true;
+}
+
+static bool isConvLikeGeneric(linalg::GenericOp op) {
+  if (!op) return false;
+  if (op.getNumDpsInputs() != 2) return false;
+  if (op.getNumResults() != 1) return false;
+
+  auto input0Type = dyn_cast<RankedTensorType>(op.getDpsInputs()[0].getType());
+  auto input1Type = dyn_cast<RankedTensorType>(op.getDpsInputs()[1].getType());
+  auto resultType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
+  if (!input0Type || !input1Type || !resultType) return false;
+
+  if (isMaxPoolLikeGeneric(op)) return false;
+
+  // Be conservative for now:
+  // conv-like generic usually has >= 3 reduction loops
+  // and weight tensor rank >= 3.
+  if (op.getNumReductionLoops() < 3) return false;
+  if (input1Type.getRank() < 3) return false;
+
+  return true;
+}
+
+#if 0
+static bool isConvLikeOp(Operation *op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  return genericOp && isConvLikeGeneric(genericOp);
+}
+#else // conv+maxpool
+static bool isConvLikeOp(Operation *op) {
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  return linalgOp && linalg::isaConvolutionOpInterface(linalgOp);
+}
+#endif
+
+static bool isElementwiseLinalgOp(Operation *op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp) return false;
+
+  return genericOp.getNumReductionLoops() == 0;
+}
+
+static bool isAllowedConvBridgeOp(Operation *op) {
+  return isElementwiseLinalgOp(op) ||
+         isa<tensor::InsertSliceOp,
+             tensor::ExtractSliceOp,
+             tensor::PadOp,
+             linalg::FillOp>(op);
+}
+#endif // MY_FUSION
+
 namespace {
 // `FusionGroup` is used to track operations that are to be fused with a given
 // `rootOp`.
@@ -785,6 +859,107 @@ static bool areAllFusionGroupUsesFusableWithProducer(
   });
 }
 
+#ifdef MY_FUSION
+static bool collectConvProducerChain(
+    Operation *op,
+    SmallVectorImpl<Operation *> &chain,
+    DenseSet<Operation *> &visited) {
+  if (!op || !visited.insert(op).second) return false;
+
+  if (isConvLikeOp(op)) {
+    chain.push_back(op);
+    return true;
+  }
+
+  if (auto insertSlice = dyn_cast<tensor::InsertSliceOp>(op)) {
+    Operation *src = insertSlice.getSource().getDefiningOp();
+    if (!src) return false;
+    chain.push_back(op);
+    if (collectConvProducerChain(src, chain, visited)) return true;
+    chain.pop_back();
+    return false;
+  }
+
+  if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
+    if (genericOp.getNumReductionLoops() != 0) return false;
+    chain.push_back(op);
+    for (Value input : genericOp.getDpsInputs()) {
+      if (Operation *def = input.getDefiningOp()) {
+        if (collectConvProducerChain(def, chain, visited)) return true;
+      }
+    }
+    chain.pop_back();
+    return false;
+  }
+
+  return false;
+}
+
+static bool isChainInternalOrDimUse(Operation *op,
+                                    DenseSet<Operation *> const &chainSet,
+                                    Operation *root) {
+  for (OpOperand &use : op->getUses()) {
+    Operation *user = use.getOwner();
+    if (isa<tensor::DimOp>(user)) continue;
+    if (user == root) continue;
+    if (!chainSet.contains(user)) return false;
+  }
+  return true;
+}
+
+static bool tryFuseConvProducerChain(
+    Operation *root, FusionGroup &fusionGroup, FusionTracker &tracker,
+    FormDispatchRegionsPassOptions const &options) {
+  if (!isConvLikeOp(root)) {
+    return false;
+  }
+
+  bool fusedSpecialChain = false;
+
+  for (OpOperand &operand : root->getOpOperands()) {
+    Operation *producer = operand.get().getDefiningOp();
+    if (!producer) continue;
+
+    DenseSet<Operation *> visited;
+    SmallVector<Operation *> chain;
+    if (!collectConvProducerChain(producer, chain, visited)) {
+      continue;
+    }
+
+    DenseSet<Operation *> chainSet(chain.begin(), chain.end());
+
+    bool valid = true;
+    for (Operation *op : chain) {
+      if (op->getBlock() != root->getBlock()) {
+        valid = false;
+        break;
+      }
+      if (tracker.isFusedOp(op) || tracker.isRootOp(op)) {
+        valid = false;
+        break;
+      }
+      if (!isChainInternalOrDimUse(op, chainSet, root)) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) continue;
+
+    // The chain is collected by walking backward from the root, so it is
+    // typically ordered from the nearest producer to the farthest one, e.g.
+    // [insert_slice, elementwise, conv1]. Append in that order to match the
+    // existing producer-fusion behavior in FormDispatchRegions.
+    for (Operation *op : chain) {
+      tracker.appendToFusionGroup(op, fusionGroup);
+    }
+    fusedSpecialChain = true;
+    break;
+  }
+
+  return fusedSpecialChain;
+}
+#endif // MY_FUSION
+
 /// Starting from the `root` op, traverse the operand use-def chain
 /// in reverse to fuse with producers.
 static void
@@ -868,6 +1043,18 @@ decideFusableLinalgOps(Region &region, DominanceInfo const &dominanceInfo,
         continue;
       }
       FusionGroup &newGroup = tracker.createFusionGroup(context, &op);
+#ifdef MY_FUSION
+      // If the current root is a convolution, attempt to fuse a preceding
+      // conv -> (elementwise / insert_slice) -> conv chain into this group.
+      bool fusedSpecialChain = false;
+      if (isConvLikeOp(&op)) {
+        fusedSpecialChain =
+            tryFuseConvProducerChain(&op, newGroup, tracker, options);
+      }
+      if (fusedSpecialChain) {
+        op.setAttr(kSpecialFusionAttr, UnitAttr::get(context));
+      }
+#endif // MY_FUSION
       fuseRootsWithProducers(context, &op, newGroup, options, tracker,
                              /*fuseWithTruncate=*/false);
       roots.push_back(&op);

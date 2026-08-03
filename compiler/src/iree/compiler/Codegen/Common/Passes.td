@@ -1166,6 +1166,54 @@ def TileAndDistributeToWorkgroupsUsingForallOpPass :
   ];
 }
 
+def RewriteConvChainAsForallPass :
+    InterfacePass<"iree-codegen-rewrite-conv-chain-as-forall",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Rewrite selected conv chains into custom scf.forall form";
+
+  let description = [{
+    Detects a custom convolution chain pattern inside a dispatch function and
+    rewrites it into a custom scf.forall/scf.for based implementation.
+    Rewritten functions are marked with an attribute so later tiling passes can
+    skip them.
+  }];
+
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
+def RewriteConvMaxpoolAsForallPass :
+    InterfacePass<"iree-codegen-rewrite-conv-maxpool-as-forall",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Fuse conv + elementwise + pad + maxpool into scf.forall";
+
+  let description = [{
+    Detects the pattern:
+      linalg.conv_2d_nchw_fchw (or generalised generic)
+      -> linalg.generic (elementwise epilogue, e.g. BN + ReLU)
+      -> tensor.insert_slice (maxpool zero-padding)
+      -> linalg.pooling_nchw_max (or generalised generic maxpool)
+    and rewrites it into a tiled scf.forall over the maxpool output
+    dimensions (C, OH, OW).
+
+    The intermediate padded tensor is eliminated.  For each forall tile a
+    small local zero-filled buffer is built; the epilogue tile is inserted
+    into it so that boundary reads by the maxpool see 0, implementing
+    implicit zero-padding without any branch in the maxpool body.
+  }];
+
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 def TileLargeTensorsPass :
     InterfacePass<"iree-codegen-tile-large-tensors", "mlir::FunctionOpInterface"> {
   let summary = "Greedily tiles all linalg ops that are beyond a certain size";

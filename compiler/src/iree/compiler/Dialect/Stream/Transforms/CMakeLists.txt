@@ -57,6 +57,8 @@ iree_cc_library(
     "VerifyAffinities.cpp"
     "VerifyAsyncAccessRanges.cpp"
     "VerifyLowerings.cpp"
+  COPTS
+    "-DMY_PACKING"
   DEPS
     ::PassesIncGen
     LLVMSupport

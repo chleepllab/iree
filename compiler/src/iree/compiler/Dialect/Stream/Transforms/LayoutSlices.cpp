@@ -34,6 +34,379 @@ namespace {
 
 using Slice = IREE::Stream::ResourcePackOp::Slice;
 
+#ifdef MY_PACKING
+struct PackingCandidate {
+  SmallVector<int64_t> offsetsByOriginalIndex;
+  int64_t highwaterMark = std::numeric_limits<int64_t>::max();
+};
+
+static int64_t 
+computeStaticSlicesLowerBound(MutableArrayRef<Slice> slices,
+                              IREE::Stream::ResourceConfigAttr resourceConfig) {
+  struct Event {
+    int64_t time = 0;
+    int64_t delta = 0;
+    bool isStart = false;
+  };
+
+  int64_t rangeAlignment = resourceConfig.getMinBufferRangeAlignment();
+
+  auto getAlignedSliceSize = [&](const Slice &slice) {
+    int64_t staticSize = 
+        cast<arith::ConstantIndexOp>(slice.dynamicSize.getDefiningOp()).value();
+    int64_t alignedSize = IREE::Util::align(staticSize, rangeAlignment);
+    return alignedSize;
+  };
+
+  SmallVector<Event> events;
+  events.reserve(slices.size() * 2);
+
+  for (auto &slice : slices) {
+    int64_t size = getAlignedSliceSize(slice);
+
+    const int64_t *data = reinterpret_cast<const int64_t*>(&slice);
+    events.push_back(Event{/*time=*/data[0],
+                           /*delta=*/size,
+                           /*isStart=*/true});
+    events.push_back(Event{/*time=*/data[1]+1,
+                           /*delta=*/-size,
+                           /*isStart=*/false});
+  }
+
+  // half-open interval [start, end):
+  llvm::sort(events, [](const Event &a, const Event &b) {
+    if (a.time != b.time) return a.time < b.time;
+    if (a.isStart != b.isStart) return a.isStart < b.isStart;
+    return a.delta < b.delta;
+  });
+
+  int64_t liveBytes = 0;
+  int64_t lowerBound = 0;
+
+  for (const auto &event : events) {
+    liveBytes += event.delta;
+    lowerBound = std::max(lowerBound, liveBytes);
+  }
+
+  //llvm::errs() << "Static slice LB (aligned) = " << lowerBound << " bytes\n";
+  return lowerBound;
+}
+
+static PackingCandidate 
+packStaticSlicesDefault(MutableArrayRef<Slice> slices,
+                        IREE::Stream::ResourceConfigAttr resourceConfig) {
+  int64_t offsetAlignment = resourceConfig.getMinBufferOffsetAlignment();
+  int64_t rangeAlignment = resourceConfig.getMinBufferRangeAlignment();
+  PackingCandidate result;
+  result.offsetsByOriginalIndex.resize(slices.size(), -1);
+  SmallVector<int64_t> order(slices.size());
+  std::iota(order.begin(), order.end(), 0);
+
+  struct Reservation {
+    const Slice *slice = nullptr;
+    int64_t staticOffset = 0;
+    int64_t staticSize = 0;
+  };
+  static constexpr int64_t UNASSIGNED = INT64_MAX;
+
+  std::list<Reservation> reservations;
+  int64_t highwaterMark = 0;
+
+  for (int64_t id : order) {
+    Slice &slice = slices[id];
+    int64_t bestOffset = UNASSIGNED;
+    int64_t bestOffsetFit = UNASSIGNED;
+    int64_t staticSize =
+        cast<arith::ConstantIndexOp>(slice.dynamicSize.getDefiningOp()).value();
+    int64_t alignedSize = IREE::Util::align(staticSize, rangeAlignment);
+    //const int64_t *data = reinterpret_cast<const int64_t*>(&slice);
+    //llvm::errs() << "[" << data[0] << ", " << data[1] << "], size = " << alignedSize << "\n";
+
+    int64_t currentOffset = 0;
+    for (auto &reservation : reservations) {
+      if (!reservation.slice->intersects(slice)) {
+        continue;
+      }
+
+      int64_t alignedOffset = IREE::Util::align(currentOffset, offsetAlignment);
+      if (alignedOffset + alignedSize <= reservation.staticOffset &&
+          reservation.staticOffset - alignedOffset < bestOffsetFit) {
+        bestOffset = alignedOffset;
+        bestOffsetFit = reservation.staticOffset - currentOffset;
+      }
+      currentOffset = std::max(currentOffset, reservation.staticOffset +
+                                                  reservation.staticSize);
+    }
+    if (bestOffset == UNASSIGNED) {
+      bestOffset = IREE::Util::align(currentOffset, offsetAlignment);
+    }
+
+    Reservation reservation;
+    reservation.slice = &slice;
+    reservation.staticOffset = bestOffset;
+    reservation.staticSize = alignedSize;
+    auto insertionIt = reservations.begin();
+    while (insertionIt != reservations.end() &&
+           insertionIt->staticOffset < reservation.staticOffset) {
+      ++insertionIt;
+    }
+    reservations.insert(insertionIt, reservation);
+    result.offsetsByOriginalIndex[id] = bestOffset;
+    highwaterMark = std::max(highwaterMark, bestOffset + alignedSize);
+  }
+
+  result.highwaterMark = IREE::Util::align(highwaterMark, rangeAlignment);
+  //llvm::errs() << "[iree-default] highwaterMark = " << result.highwaterMark << "\n";
+  return result;
+}
+
+static PackingCandidate 
+packStaticSlicesStartTimeFirstFit(
+      MutableArrayRef<Slice> slices,
+      IREE::Stream::ResourceConfigAttr resourceConfig) {
+  int64_t offsetAlignment = resourceConfig.getMinBufferOffsetAlignment();
+  int64_t rangeAlignment = resourceConfig.getMinBufferRangeAlignment();
+  PackingCandidate result;
+  result.offsetsByOriginalIndex.resize(slices.size(), -1);
+  SmallVector<int64_t> order(slices.size());
+  std::iota(order.begin(), order.end(), 0);
+
+  struct Reservation {
+    const Slice *slice = nullptr;
+    int64_t staticOffset = 0;
+    int64_t staticSize = 0;
+  };
+
+  auto getSliceStartTime = [](const Slice &slice) {
+    const int64_t *data = reinterpret_cast<const int64_t*>(&slice);
+    return data[0];
+  };
+  auto getSliceEndTime = [](const Slice &slice) {
+    const int64_t *data = reinterpret_cast<const int64_t*>(&slice);
+    return data[1];
+  };
+  auto getAlignedSliceSize = [&](const Slice &slice) {
+    int64_t staticSize = 
+        cast<arith::ConstantIndexOp>(slice.dynamicSize.getDefiningOp()).value();
+    int64_t alignedSize = IREE::Util::align(staticSize, rangeAlignment);
+    return alignedSize;
+  };
+
+  llvm::sort(order, [&](const int64_t &a, const int64_t &b) {
+    int64_t aStart = getSliceStartTime(slices[a]);
+    int64_t bStart = getSliceStartTime(slices[b]);
+    if (aStart != bStart) return aStart < bStart;
+
+    int64_t aSize = getAlignedSliceSize(slices[a]);
+    int64_t bSize = getAlignedSliceSize(slices[b]);
+    if (aSize != bSize) return aSize > bSize;
+
+    int64_t aEnd = getSliceEndTime(slices[a]);
+    int64_t bEnd = getSliceEndTime(slices[b]);
+    return aEnd < bEnd;
+  });
+
+  std::list<Reservation> reservations;
+  int64_t highwaterMark = 0;
+
+  for (int64_t id : order) {
+    Slice &slice = slices[id];
+    int64_t staticSize = cast<arith::ConstantIndexOp>(slice.dynamicSize.getDefiningOp()).value();
+    int64_t alignedSize = IREE::Util::align(staticSize, rangeAlignment);
+
+    SmallVector<Reservation> conflicts;
+    conflicts.reserve(reservations.size());
+    for (auto &reservation : reservations) {
+      if (reservation.slice->intersects(slice)) {
+        conflicts.push_back(reservation);
+      }
+    }
+
+    llvm::sort(conflicts, [](const Reservation &a, const Reservation &b) {
+      return a.staticOffset < b.staticOffset;
+    });
+
+    int64_t chosenOffset = IREE::Util::align(0, offsetAlignment);
+    for (auto &conflict : conflicts) {
+      int64_t alignedOffset =
+          IREE::Util::align(chosenOffset, offsetAlignment);
+
+      if (alignedOffset + alignedSize <= conflict.staticOffset) {
+        chosenOffset = alignedOffset;
+        break;
+      }
+
+      chosenOffset = std::max(
+          chosenOffset, conflict.staticOffset + conflict.staticSize);
+      chosenOffset = IREE::Util::align(chosenOffset, offsetAlignment);
+    }
+
+    chosenOffset = IREE::Util::align(chosenOffset, offsetAlignment);
+
+    Reservation reservation;
+    reservation.slice = &slice;
+    reservation.staticOffset = chosenOffset;
+    reservation.staticSize = alignedSize;
+
+    auto insertionIt = reservations.begin();
+    while (insertionIt != reservations.end() &&
+           insertionIt->staticOffset < reservation.staticOffset) {
+      ++insertionIt;
+    }
+    reservations.insert(insertionIt, reservation);
+    result.offsetsByOriginalIndex[id] = chosenOffset;
+    highwaterMark = std::max(highwaterMark, chosenOffset + alignedSize);
+  }
+
+  result.highwaterMark = IREE::Util::align(highwaterMark, rangeAlignment);
+  //llvm::errs() << "[start-time-first-fit] highwaterMark = " << result.highwaterMark << "\n";
+  return result;
+}
+
+static PackingCandidate 
+packStaticSlicesSizeDescBestFit(MutableArrayRef<Slice> slices,
+                                IREE::Stream::ResourceConfigAttr resourceConfig) {
+  int64_t offsetAlignment = resourceConfig.getMinBufferOffsetAlignment();
+  int64_t rangeAlignment = resourceConfig.getMinBufferRangeAlignment();
+  PackingCandidate result;
+  result.offsetsByOriginalIndex.resize(slices.size(), -1);
+  SmallVector<int64_t> order(slices.size());
+  std::iota(order.begin(), order.end(), 0);
+
+  struct Reservation {
+    const Slice *slice = nullptr;
+    int64_t staticOffset = 0;
+    int64_t staticSize = 0;
+  };
+  static constexpr int64_t UNASSIGNED = INT64_MAX;
+
+  auto getSliceStartTime = [](const Slice &slice) {
+    const int64_t *data = reinterpret_cast<const int64_t*>(&slice);
+    return data[0];
+  };
+  auto getSliceEndTime = [](const Slice &slice) {
+    const int64_t *data = reinterpret_cast<const int64_t*>(&slice);
+    return data[1];
+  };
+  auto getAlignedSliceSize = [&](const Slice &slice) {
+    int64_t staticSize = 
+        cast<arith::ConstantIndexOp>(slice.dynamicSize.getDefiningOp()).value();
+    int64_t alignedSize = IREE::Util::align(staticSize, rangeAlignment);
+    return alignedSize;
+  };
+
+  llvm::sort(order, [&](const int64_t &a, const int64_t &b) {
+    int64_t aSize = getAlignedSliceSize(slices[a]);
+    int64_t bSize = getAlignedSliceSize(slices[b]);
+    if (aSize != bSize) return aSize > bSize;
+
+    int64_t aStart = getSliceStartTime(slices[a]);
+    int64_t bStart = getSliceStartTime(slices[b]);
+    if (aStart != bStart) return aStart < bStart;
+
+    int64_t aEnd = getSliceEndTime(slices[a]);
+    int64_t bEnd = getSliceEndTime(slices[b]);
+    return aEnd < bEnd;
+  });
+
+  std::list<Reservation> reservations;
+  int64_t highwaterMark = 0;
+
+  for (int64_t id : order) {
+    Slice &slice = slices[id];
+    int64_t bestOffset = UNASSIGNED;
+    int64_t bestOffsetFit = UNASSIGNED;
+    int64_t staticSize =
+        cast<arith::ConstantIndexOp>(slice.dynamicSize.getDefiningOp()).value();
+    int64_t alignedSize = IREE::Util::align(staticSize, rangeAlignment);
+
+    int64_t currentOffset = 0;
+    for (auto &reservation : reservations) {
+      if (!reservation.slice->intersects(slice)) {
+        continue;
+      }
+
+      int64_t alignedOffset =
+          IREE::Util::align(currentOffset, offsetAlignment);
+      if (alignedOffset + alignedSize <= reservation.staticOffset &&
+          reservation.staticOffset - alignedOffset < bestOffsetFit) {
+        bestOffset = alignedOffset;
+        bestOffsetFit = reservation.staticOffset - alignedOffset;
+      }
+
+      currentOffset = std::max(
+          currentOffset, reservation.staticOffset + reservation.staticSize);
+    }
+
+    if (bestOffset == UNASSIGNED) {
+      bestOffset = IREE::Util::align(currentOffset, offsetAlignment);
+    }
+
+    Reservation reservation;
+    reservation.slice = &slice;
+    reservation.staticOffset = bestOffset;
+    reservation.staticSize = alignedSize;
+
+    auto insertionIt = reservations.begin();
+    while (insertionIt != reservations.end() &&
+           insertionIt->staticOffset < reservation.staticOffset) {
+      ++insertionIt;
+    }
+    reservations.insert(insertionIt, reservation);
+    result.offsetsByOriginalIndex[id] = bestOffset;
+    highwaterMark = std::max(highwaterMark, bestOffset + alignedSize);
+  }
+
+  result.highwaterMark = IREE::Util::align(highwaterMark, rangeAlignment);
+  llvm::errs() << "[size-desc-best-fit] highwaterMark = " << result.highwaterMark << "\n";
+  return result;
+}
+
+static PackingCandidate 
+chooseBestStaticSlicePacking(MutableArrayRef<Slice> slices,
+                             IREE::Stream::ResourceConfigAttr resourceConfig) {
+  PackingCandidate best = packStaticSlicesDefault(slices, resourceConfig);
+  int64_t lowerBound = computeStaticSlicesLowerBound(slices, resourceConfig);
+  if (lowerBound == best.highwaterMark)
+    return best;
+
+  {
+      PackingCandidate candidate = 
+          packStaticSlicesStartTimeFirstFit(slices, resourceConfig);
+      if (candidate.highwaterMark < best.highwaterMark) {
+          best = std::move(candidate);
+      }
+  }
+
+  {
+      PackingCandidate candidate = 
+          packStaticSlicesSizeDescBestFit(slices, resourceConfig);
+      if (candidate.highwaterMark < best.highwaterMark) {
+          best = std::move(candidate);
+      }
+  }
+
+  return best;
+}
+
+static Value 
+packStaticSlices(Location loc, Value baseOffset,
+                 MutableArrayRef<Slice> slices,
+                 IREE::Stream::ResourceConfigAttr resourceConfig,
+                 IndexSet &indexSet, OpBuilder &builder) {
+  PackingCandidate result = chooseBestStaticSlicePacking(slices, resourceConfig);
+
+  // apply static slice packing
+  for (auto [id, slice] : llvm::enumerate(slices)) {
+      slice.packedOffset.replaceAllUsesWith(builder.createOrFold<arith::AddIOp>(
+          loc, baseOffset, indexSet.get(result.offsetsByOriginalIndex[id])));
+  }
+
+  return builder.createOrFold<arith::AddIOp>(
+          loc, baseOffset, indexSet.get(result.highwaterMark));
+}
+#endif // MY_PACKING
+
 // Packs a set of statically-sized slices by greedy strip packing.
 //
 // This is the same algorithm used in tflite here:
@@ -257,8 +630,13 @@ struct LayoutSlicesPass
       // compile time.
       Value offset = packOp.getOffset() ? packOp.getOffset() : indexSet.get(0);
       if (!staticSlices.empty()) {
+#ifdef MY_PACKING
+        offset =  packStaticSlices(packOp.getLoc(), offset, staticSlices,
+                                          resourceConfig, indexSet, builder);
+#else
         offset = packStaticSlicesGreedily(packOp.getLoc(), offset, staticSlices,
                                           resourceConfig, indexSet, builder);
+#endif // MY_PACKING
 
         // TODO(benvanik): make this an option; it can be useful for debugging
         // this code.
