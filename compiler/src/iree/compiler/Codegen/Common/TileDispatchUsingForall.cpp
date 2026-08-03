@@ -225,8 +225,19 @@ static bool isUsedAsInit(Operation *producer, Operation *user) {
   });
 }
 
+#ifdef MY_PASS
+static constexpr StringLiteral kConvChainRewrittenAttr =
+    "iree_codegen.conv_chain_rewritten";
+#endif // MY_PASS
+
 void TileAndDistributeToWorkgroupsUsingForallOpPass::runOnOperation() {
   mlir::FunctionOpInterface funcOp = getOperation();
+#ifdef MY_PASS
+  if (funcOp->hasAttr(kConvChainRewrittenAttr)) {
+    return;
+  }
+#endif // MY_PASS
+
   auto *context = &getContext();
   SmallVector<Operation *> computeOps = getComputeOps(funcOp);
 

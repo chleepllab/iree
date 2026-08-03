@@ -158,6 +158,8 @@ iree_cc_library(
     "ReshapePatterns.cpp"
     "ResolveSwizzleHints.cpp"
     "ResolveWorkgroupCountHints.cpp"
+    "RewriteConvChainAsForall.cpp"
+    "RewriteConvMaxpoolAsForall.cpp"
     "SMTConstraintUtils.cpp"
     "SpecializeExports.cpp"
     "SplitFullPartialTransfer.cpp"
@@ -180,6 +182,8 @@ iree_cc_library(
     "VectorizeMemrefCopy.cpp"
     "VerifyPipelineConstraints.cpp"
     "VerifyWorkgroupDistribution.cpp"
+  COPTS
+    "-DMY_PASS"
   DEPS
     ::PassHeaders
     ::PassesIncGen
