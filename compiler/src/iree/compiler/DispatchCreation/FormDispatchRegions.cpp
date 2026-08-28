@@ -98,11 +98,9 @@ static bool isConvLikeGeneric(linalg::GenericOp op) {
 
   if (isMaxPoolLikeGeneric(op)) return false;
 
-  // Be conservative for now:
-  // conv-like generic usually has >= 3 reduction loops
-  // and weight tensor rank >= 3.
   if (op.getNumReductionLoops() < 3) return false;
-  if (input1Type.getRank() < 3) return false;
+  if (input1Type.getRank() != 4) return false;
+  if (input0Type.getRank() != 3 && input0Type.getRank() != 4) return false;
 
   return true;
 }
@@ -115,7 +113,23 @@ static bool isConvLikeOp(Operation *op) {
 #else // conv+maxpool
 static bool isConvLikeOp(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-  return linalgOp && linalg::isaConvolutionOpInterface(linalgOp);
+  if (!linalgOp || !linalg::isaConvolutionOpInterface(linalgOp)) {
+    return false;
+  }
+#ifdef MY_FUSION
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp) {
+    return false;
+  }
+  // Exactly two reduction loops is the max-pool shape
+  // RewriteConvMaxpoolAsForall takes; everything else has to satisfy the
+  // conv-chain matcher.
+  return genericOp.getNumReductionLoops() == 2
+             ? isMaxPoolLikeGeneric(genericOp)
+             : isConvLikeGeneric(genericOp);
+#else
+  return true;
+#endif // MY_FUSION
 }
 #endif
 
@@ -1003,6 +1017,12 @@ static bool tryFuseConvProducerChain(
     Operation *root, FusionGroup &fusionGroup, FusionTracker &tracker,
     FormDispatchRegionsPassOptions const &options) {
   if (!isConvLikeOp(root)) {
+    return false;
+  }
+
+  if (llvm::none_of(cast<linalg::LinalgOp>(root).getDpsInputs(), [](Value v) {
+        return v.getDefiningOp<tensor::InsertSliceOp>();
+      })) {
     return false;
   }
 
