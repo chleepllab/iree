@@ -51,6 +51,8 @@ iree_cc_library(
     "ReplicateGlobalsPerAffinity.cpp"
     "TopLevelSCFToCFG.cpp"
     "VerifyInputLegality.cpp"
+  COPTS
+    "-DMY_FUSION"
   DEPS
     ::PassesIncGen
     LLVMSupport
