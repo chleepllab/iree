@@ -505,6 +505,42 @@ getFusableUses(MLIRContext *context, Operation *op,
   return usesVec;
 }
 
+#ifdef MY_FUSION
+/// Returns the use of `op` by a `tensor.insert_slice` that writes into a
+/// `linalg.fill` -- the form a `tensor.pad` takes after
+/// DispatchCreation/TensorPadToTensorInsertSlice.cpp. Such a use is worth
+/// fusing into `op`'s own dispatch even when `op` has several users, which is
+/// why it is looked up separately from `getFusableUses`: outside aggressive
+/// mode that one returns nothing as soon as `op` has more than one distinct
+/// consumer (it counts consumers rather than operand uses, so that one consumer
+/// reading several results of a multi-result producer still qualifies -- either
+/// way a pad alongside any other consumer is two). Padding a value that is also
+/// consumed unpadded is the norm in a residual network: the conv output feeds
+/// both the pad of the next conv and the skip connection. Unfused, the slice
+/// becomes a standalone copy dispatch that reads the whole result back in.
+///
+/// Returns null unless there is exactly one such use, so that a value padded
+/// several different ways keeps the old behavior instead of picking one
+/// arbitrarily.
+static OpOperand *getPadInsertSliceUse(Operation *op) {
+  OpOperand *padUse = nullptr;
+  for (OpOperand &use : op->getUses()) {
+    auto insertSliceOp = dyn_cast<tensor::InsertSliceOp>(use.getOwner());
+    if (!insertSliceOp || insertSliceOp.getSource() != use.get()) {
+      continue;
+    }
+    if (!insertSliceOp.getDest().getDefiningOp<linalg::FillOp>()) {
+      continue;
+    }
+    if (padUse) {
+      return nullptr;
+    }
+    padUse = &use;
+  }
+  return padUse;
+}
+#endif // MY_FUSION
+
 /// For the fusion of root op -> elementwise operation to be bufferized
 /// in-place without use of extra memory, the result of the root operation
 /// must be able to reuse the buffer for the result of the elementwise
@@ -611,9 +647,20 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
   if (auto insertSliceOp = dyn_cast<tensor::InsertSliceOp>(consumer)) {
     // TODO: Enable multi-use slice source fusion.
     Value source = insertSliceOp.getSource();
-    if (!source.hasOneUse() || source.getDefiningOp() != producer) {
+    if (source.getDefiningOp() != producer) {
       return false;
     }
+#ifdef MY_FUSION
+    // A multi-use source is fine here: the slice only writes into `dest`, so
+    // the producer's own result stays available and is simply yielded as an
+    // extra dispatch result.
+    // Left unfused it becomes a whole extra `slow_memcpy` dispatch that re-reads
+    // that result.
+#else
+    if (!source.hasOneUse()) {
+      return false;
+    }
+#endif // MY_FUSION
     // Fuse in `insert_slice` consumer operations if destination is a fill.
     // TODO: This can be generalized, but destination cannot be a
     // `arith.constant` or other constant-like objects. `linalg.fill` captures a
@@ -732,6 +779,18 @@ fuseRootsWithConsumers(MLIRContext *context, ArrayRef<Operation *> roots,
       SmallVector<OpOperand *> fusableUses =
           getFusableUses(context, currRoot, dominanceInfo,
                          /*aggressiveFusion=*/options.aggressiveFusion);
+#ifdef MY_FUSION
+      // `getFusableUses` returns nothing for a value with more than one
+      // distinct consumer, which hides the one consumer that is still worth
+      // fusing there: the `insert_slice` of a pad.
+      if (fusableUses.empty()) {
+        if (OpOperand *padUse = getPadInsertSliceUse(currRoot)) {
+          if (padUse->getOwner()->getBlock() == currRoot->getBlock()) {
+            fusableUses.push_back(padUse);
+          }
+        }
+      }
+#endif // MY_FUSION
       if (fusableUses.empty()) {
         continue;
       }
@@ -907,6 +966,39 @@ static bool isChainInternalOrDimUse(Operation *op,
   return true;
 }
 
+/// The `dest` of the `tensor.insert_slice` ops in the chain is the
+/// zero-/-inf-filled tensor that materializes a conv's (or max-pool's) padding.
+/// By default RegionOpUtils.cpp keeps the producer of an `insert_slice` dest
+/// out of the dispatch -- it screens for that twice, once up front through
+/// `isUnfusableInit` (whose backward slices seed `collectUnfusableInitSources`)
+/// and once per use in `hasUnfusableUseInDispatch` -- so unless that
+/// `linalg.fill` is *moved* in as part of the fusion group it stays outside and
+/// becomes a full-size stream transient, allocated and memset on every
+/// invocation, even though the codegen rewrite later drops every read of it.
+/// `isPaddedTemporaryInsertSlice` carves this shape out of both screens, but
+/// that only makes the fill *cloneable*; something still has to put it in the
+/// group, which is what this does. Their `tensor.empty` operands are then
+/// trivially cloneable and get pulled in by CloneProducersIntoDispatchRegions.
+static void collectPadDestOps(ArrayRef<Operation *> chain, Operation *root,
+                              const FusionTracker &tracker,
+                              DenseSet<Operation *> &chainSet,
+                              SmallVectorImpl<Operation *> &destOps) {
+  for (Operation *op : chain) {
+    auto insertSlice = dyn_cast<tensor::InsertSliceOp>(op);
+    if (!insertSlice) continue;
+
+    Operation *destOp = insertSlice.getDest().getDefiningOp();
+    if (!isa_and_nonnull<linalg::FillOp>(destOp)) continue;
+    if (destOp->getBlock() != root->getBlock()) continue;
+    if (tracker.isFusedOp(destOp) || tracker.isRootOp(destOp)) continue;
+    if (chainSet.contains(destOp)) continue;
+    if (!isChainInternalOrDimUse(destOp, chainSet, root)) continue;
+
+    chainSet.insert(destOp);
+    destOps.push_back(destOp);
+  }
+}
+
 static bool tryFuseConvProducerChain(
     Operation *root, FusionGroup &fusionGroup, FusionTracker &tracker,
     FormDispatchRegionsPassOptions const &options) {
@@ -945,11 +1037,21 @@ static bool tryFuseConvProducerChain(
     }
     if (!valid) continue;
 
+    // Pull in the `linalg.fill`s that initialize the padding tensors the chain
+    // writes into, so they do not survive as dispatch operands. The group is
+    // topologically sorted before the region is built, so append order is
+    // irrelevant.
+    SmallVector<Operation *> destOps;
+    collectPadDestOps(chain, root, tracker, chainSet, destOps);
+
     // The chain is collected by walking backward from the root, so it is
     // typically ordered from the nearest producer to the farthest one, e.g.
     // [insert_slice, elementwise, conv1]. Append in that order to match the
     // existing producer-fusion behavior in FormDispatchRegions.
     for (Operation *op : chain) {
+      tracker.appendToFusionGroup(op, fusionGroup);
+    }
+    for (Operation *op : destOps) {
       tracker.appendToFusionGroup(op, fusionGroup);
     }
     fusedSpecialChain = true;
@@ -1126,6 +1228,64 @@ decideFusableLinalgOps(Region &region, DominanceInfo const &dominanceInfo,
 // Dispatch region formation
 //===----------------------------------------------------------------------===//
 
+#ifdef MY_FUSION
+/// Once a pad's `tensor.insert_slice` has been fused into the dispatch that
+/// produces its source, the region yields the padded tensor.
+///
+/// The unpadded result is then dead and `DispatchRegionDropUnusedResults`, the
+/// canonicalization pattern on `flow.dispatch.region`, removes it, leaving a
+/// single store.
+static void
+dropDispatchResultsCoveredByPad(RewriterBase &rewriter,
+                                IREE::Flow::DispatchRegionOp regionOp) {
+  if (!llvm::hasSingleElement(regionOp.getBody())) {
+    return;
+  }
+  auto returnOp = dyn_cast<IREE::Flow::ReturnOp>(
+      regionOp.getBody().front().getTerminator());
+  if (!returnOp) {
+    return;
+  }
+
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPointAfter(regionOp);
+  ValueRange yielded = returnOp.getOperands();
+  for (auto [padIdx, padValue] : llvm::enumerate(yielded)) {
+    auto insertSliceOp = padValue.getDefiningOp<tensor::InsertSliceOp>();
+    if (!insertSliceOp) {
+      continue;
+    }
+    if (!insertSliceOp.getType().hasStaticShape() ||
+        !insertSliceOp.getSourceType().hasStaticShape() ||
+        llvm::any_of(insertSliceOp.getMixedOffsets(), [](OpFoldResult ofr) {
+          return !getConstantIntValue(ofr).has_value();
+        }) ||
+        llvm::any_of(insertSliceOp.getMixedStrides(), [](OpFoldResult ofr) {
+          return getConstantIntValue(ofr) != std::optional<int64_t>(1);
+        })) {
+      continue;
+    }
+
+    auto sourceIt = llvm::find(yielded, insertSliceOp.getSource());
+    if (sourceIt == yielded.end()) {
+      continue;
+    }
+    Value unpaddedResult =
+        regionOp->getResult(std::distance(yielded.begin(), sourceIt));
+    if (unpaddedResult.use_empty()) {
+      continue;
+    }
+
+    Value slice = tensor::ExtractSliceOp::create(
+        rewriter, regionOp.getLoc(),
+        cast<RankedTensorType>(unpaddedResult.getType()),
+        regionOp->getResult(padIdx), insertSliceOp.getMixedOffsets(),
+        insertSliceOp.getMixedSizes(), insertSliceOp.getMixedStrides());
+    rewriter.replaceAllUsesWith(unpaddedResult, slice);
+  }
+}
+#endif // MY_FUSION
+
 /// Create IREE::Flow::DispatchGroupsOps based on a fusion heuristic.
 static LogicalResult
 createFusionGroups(TensorDimTrackingRewriter &rewriter,
@@ -1234,6 +1394,12 @@ createFusionGroups(TensorDimTrackingRewriter &rewriter,
     }
     regionOps.push_back(regionOp);
   }
+
+#ifdef MY_FUSION
+  for (IREE::Flow::DispatchRegionOp regionOp : regionOps) {
+    dropDispatchResultsCoveredByPad(rewriter, regionOp);
+  }
+#endif // MY_FUSION
 
   LLVM_DEBUG({
     llvm::dbgs() << "\n--- After creating flow.dispatch.region ---\n";

@@ -861,11 +861,32 @@ bool isCloneableIntoDispatchOp(Operation *op,
   return false;
 }
 
+#ifdef MY_FUSION
+/// Returns true if `insertSliceOp`'s result never leaves the block it is in,
+/// i.e. it is not yielded by the terminator. Then it is not an in-place update
+/// of a dispatch result but a padded temporary (the `fill` + `insert_slice`
+/// that DispatchCreation/TensorPadToTensorInsertSlice.cpp emits for
+/// `tensor.pad`), and keeping its `dest` producer outside the dispatch costs a
+/// full-size operand buffer that is allocated and memset on every invocation.
+/// Cloning is safe here and, unlike moving the producer in, also handles a
+/// `fill` shared by several pads: each region gets its own copy.
+static bool isPaddedTemporaryInsertSlice(tensor::InsertSliceOp insertSliceOp) {
+  return llvm::none_of(insertSliceOp->getUsers(), [](Operation *sliceUser) {
+    return sliceUser->hasTrait<OpTrait::IsTerminator>();
+  });
+}
+#endif // MY_FUSION
+
 /// Returns true if `operand` is an init that producers cannot be fused
 /// through (scatter's `original`, insert_slice's `dest`, ...).
 static bool isUnfusableInit(OpOperand &operand) {
   Operation *op = operand.getOwner();
   if (auto insertSlice = dyn_cast<tensor::InsertSliceOp>(op)) {
+#ifdef MY_FUSION
+    if (isPaddedTemporaryInsertSlice(insertSlice)) {
+      return false;
+    }
+#endif // MY_FUSION
     return insertSlice.getDest() == operand.get();
   }
   auto dpsOp = dyn_cast<DestinationStyleOpInterface>(op);
@@ -948,6 +969,11 @@ hasUnfusableUseInDispatch(Value v, Operation *dispatchOp,
 
     if (auto insertSlice = dyn_cast<tensor::InsertSliceOp>(user);
         insertSlice && use.get() == insertSlice.getDest()) {
+#ifdef MY_FUSION
+      if (isPaddedTemporaryInsertSlice(insertSlice)) {
+        continue;
+      }
+#endif // MY_FUSION
       return true;
     }
   }
