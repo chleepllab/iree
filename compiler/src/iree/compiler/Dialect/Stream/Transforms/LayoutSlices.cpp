@@ -14,6 +14,7 @@
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "iree/compiler/Utils/IntegerSet.h"
+#include "iree/compiler/Utils/CustomFusion.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/AsmState.h"
@@ -631,12 +632,16 @@ struct LayoutSlicesPass
       Value offset = packOp.getOffset() ? packOp.getOffset() : indexSet.get(0);
       if (!staticSlices.empty()) {
 #ifdef MY_PACKING
-        offset =  packStaticSlices(packOp.getLoc(), offset, staticSlices,
-                                          resourceConfig, indexSet, builder);
-#else
-        offset = packStaticSlicesGreedily(packOp.getLoc(), offset, staticSlices,
-                                          resourceConfig, indexSet, builder);
+        if (isCustomPackingEnabled()) {
+          offset = packStaticSlices(packOp.getLoc(), offset, staticSlices,
+                                    resourceConfig, indexSet, builder);
+        } else
 #endif // MY_PACKING
+        {
+          offset = packStaticSlicesGreedily(packOp.getLoc(), offset,
+                                            staticSlices, resourceConfig,
+                                            indexSet, builder);
+        }
 
         // TODO(benvanik): make this an option; it can be useful for debugging
         // this code.

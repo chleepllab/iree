@@ -1,0 +1,172 @@
+# Gated-MLP fusion (`--iree-dispatch-creation-fuse-mlp`)
+
+Fuses the gated MLP of a transformer layer into one dispatch so the two
+`[S, ffn]` intermediates (`gate`, `up`) are never materialized in the transient
+arena. Only the LLVMCPU backend has the codegen side.
+
+```
+gate = x * Wg^T            [M, F] f32      (F = ffn width, 8192 for llama-3.2-1b)
+up   = x * Wu^T            [M, F] f32
+h    = silu(gate) * up     [M, F] f16
+down = h * Wd^T            [M, N] f32      (root)
+out  = epilogue(down, ...) [M, N]          (trunc + residual add)
+```
+
+## Flags
+
+All custom work is off by default; with no flags the compiler behaves as
+upstream IREE. The switches live in `compiler/src/iree/compiler/Utils/CustomFusion.{h,cpp}`.
+
+| Flag | Turns on |
+|---|---|
+| `--iree-dispatch-creation-fuse-mlp=true` | MLP dispatch formation, `RewriteMLPChainAsForall`, canonicalize/CSE after it, custom slice packing |
+| `--iree-dispatch-creation-fuse-conv-chain=true` | conv -> conv / conv -> maxpool chain fusion, conv pad-into-producer fusion, conv rewrite passes, conv tile-and-decompose passes, custom slice packing |
+| `--iree-stream-custom-packing=true` | custom static slice packer only |
+
+Pass both fusion flags to enable all optimizations. `fuse-mlp` does not turn
+on any of the conv chain work.
+
+Recommended: also pass `--iree-llvmcpu-stack-allocation-limit=131072` (see
+[Row tile TM](#row-tile-tm)).
+
+```
+iree-compile llama-3.2-1b-instruct-f16.mlir -o llama.vmfb \
+    --iree-hal-target-device=local \
+    --iree-hal-local-target-device-backends=llvm-cpu \
+    --iree-llvmcpu-target-cpu=host \
+    --iree-dispatch-creation-fuse-mlp=true \
+    --iree-llvmcpu-stack-allocation-limit=131072
+```
+
+## Where it happens
+
+| Stage | File | What |
+|---|---|---|
+| Dispatch creation | `DispatchCreation/FormDispatchRegions.cpp` (`tryFuseMLPChain`) | Pulls gate/up matmuls and the activation into the `down` matmul's dispatch, tags the root `iree_dispatch.special_mlp` |
+| Codegen | `Codegen/Common/RewriteMLPChainAsForall.cpp` | Tiles the fused dispatch (below), tags the function `iree_codegen.mlp_chain_rewritten` |
+| Codegen | `Codegen/Common/TileDispatchUsingForall.cpp` | Skips functions tagged `iree_codegen.mlp_chain_rewritten` |
+| Codegen | `Codegen/LLVMCPU/Passes.cpp` | Adds `RewriteMLPChainAsForall` + canonicalize/CSE before workgroup tiling when the flag is on |
+| Stream | `Dialect/Stream/Transforms/LayoutSlices.cpp` | Custom static slice packer (no effect on llama, see results) |
+
+## Loop structure
+
+Same M -> K2 -> N nesting as Hexagon's `HexagonMatmulFusionPass` (K2 = F):
+fc1 (gate/up/silu) has no N axis and sits above the N loop, so it is computed
+once per (M, F) tile, not once per N tile.
+
+```
+scf.forall m (TM rows)                               // step 1: M, workgroups
+  acc = 0                       [TM, N] f32
+  scf.for f (kFfnChunk = 128)                        // step 2: F, gate/up/h fused in
+    gate, up = x[m] @ Wg/Wu[f]^T  [TM, 128] f32
+    h = silu(gate) * up           [TM, 128] f16
+    scf.for m' (8) / n (16) / k (16)                 // step 3: down tiled alone
+      acc[m', n] += h[m', k] @ Wd[n, k]^T
+  out[m] = epilogue(acc)
+```
+
+Differences from Hexagon:
+
+| | Hexagon | IREE `fuse-mlp` |
+|---|---|---|
+| M loop | `scf.for` | `scf.forall` mapped to workgroups |
+| M + K2 | one tile-and-fuse (`{tileM, tileK, 0}`) | two calls: M, then F with gate/up/h fused |
+| N loop | tile-and-fuse of fc2 over N | `down` tiled alone to 8x16x16 (vector size) |
+| Producers | one matmul + GELU | two matmuls (gate, up) + SiLU*mul |
+
+Every op is tiled alone to vector size and its `lowering_config` dropped;
+otherwise the vector-level tile-and-fuse passes would anchor on `down` and
+fuse `h` into each N tile, recomputing the chunk N/16 times.
+
+## Row tile TM
+
+`pickRowTile` picks the largest power of two <= `kVecM` (8) whose stack buffers
+fit in 3/4 of the target's `max_stack_allocation_size`:
+
+- bytes per row = N*4 (f32 acc) + 128*(4+4+2) (gate, up f32; h f16) = 2048*4 + 1280 = 9,472 B
+- 32 KiB default limit -> budget 24,576 B -> **TM = 2** (TM=4 needs 37,888 B)
+- 128 KiB limit -> budget 98,304 B -> **TM = 8** (75,776 B)
+
+Each workgroup streams all of Wg, Wu, Wd for its TM rows, so TM sets how many
+times the MLP weights are read per layer: S/TM = 256 passes at TM=2, 64 at
+TM=8. At TM=2 fused prefill is ~1.3 s slower than baseline; TM=8 removes it.
+
+## Results
+
+Host: AMD Ryzen 9 9950X (32 threads), `--device=local-task`.
+Model: llama-3.2-1b-instruct f16, `prefill_bs1`, S=512, KV cache 128x524288 f16.
+Transient buffer size is captured at runtime with a gdb breakpoint on
+`iree_hal_device_queue_alloca` (sizes are dynamic, not readable from the IR);
+`HOST_LOCAL`/`DEVICE_LOCAL` from `--print_statistics` do not include it.
+
+### Baseline / custom packing / custom fusion (default 32 KiB stack, TM=2)
+
+| LLaMA-3.2-1B f16, prefill S=512 | Baseline (no flags) | Custom packing (`--iree-stream-custom-packing=true`) | Custom fusion (`--iree-dispatch-creation-fuse-mlp=true`) |
+|---|---:|---:|---:|
+| Transient buffer (activations) | 45,353,344 B | 45,353,344 B | 28,576,128 B |
+| Max RSS (3 runs) | 2,872,576–2,872,832 KB | 2,872,064–2,873,344 KB | 2,855,680–2,856,192 KB |
+| `HOST_LOCAL` peak (`--print_statistics`) | 265,551,872 B | 265,551,872 B | 265,551,872 B |
+| `DEVICE_LOCAL` peak (`--print_statistics`) | 134,222,088 B | 134,222,088 B | 134,222,088 B |
+| Minor page faults | ~766,580 | ~766,360 | ~758,430 |
+| Dispatch ops (prefill / whole module) | 363 / 822 | 363 / 822 | 331 / 758 |
+| Number of executables (prefill / whole module) | 45 / 122 | 45 / 122 | 43 / 118 |
+| Wall time (3 runs) | 2.21–2.37 s | 2.17–2.23 s | 3.47–3.64 s |
+| Output (1×512×128256 logits) | — | bit-identical to baseline | bit-identical to baseline |
+
+- Transient buffer: −16,777,216 B (exactly 16 MiB, −37.0%) = the two
+  `[512, 8192]` f16 MLP intermediates. Saving scales linearly with S.
+- `HOST_LOCAL` is the logits output, `DEVICE_LOCAL` the KV cache; neither
+  includes the transient arena, so both are unchanged.
+- Custom packing has no effect on llama: its transient slices are
+  dynamically sized and the custom packer only handles static slices.
+- 2 fewer dispatches per layer (16 layers unrolled): 363 -> 331 in prefill.
+
+### Effect of TM (stack limit)
+
+| LLaMA-3.2-1B f16, prefill S=512 | Baseline (32 KiB stack) | Baseline (128 KiB stack) | Custom fusion, TM=2 (32 KiB stack) | Custom fusion, TM=8 (128 KiB stack) |
+|---|---:|---:|---:|---:|
+| Transient buffer (activations) | 45,353,344 B | 45,353,344 B | 28,576,128 B | 28,576,128 B |
+| Max RSS (3 runs) | 2,872,320–2,872,832 KB | 2,872,064–2,872,832 KB | 2,855,936–2,856,192 KB | 2,856,448–2,856,960 KB |
+| `HOST_LOCAL` peak | 265,551,872 B | 265,551,872 B | 265,551,872 B | 265,551,872 B |
+| `DEVICE_LOCAL` peak | 134,222,088 B | 134,222,088 B | 134,222,088 B | 134,222,088 B |
+| Minor page faults | ~767,030 | ~766,570 | ~758,270 | ~758,310 |
+| Wall time (3 runs) | 2.33–2.48 s | 2.17–2.49 s | 3.61–3.69 s | **2.14–2.31 s** |
+| Output | — | bit-identical | bit-identical | bit-identical |
+
+- The stack limit alone does not change the baseline.
+- TM=8 brings fused prefill back to baseline speed (slightly faster) with the
+  same 16 MiB transient saving. Max RSS is ~0.5–0.75 MiB above TM=2 from the
+  larger per-thread stack buffers.
+
+## Reproducing
+
+`~/workspace/run_llama.sh [SEQ_LEN]` compiles and runs prefill + decode; add
+the flags above to its `iree-compile` line. Transient size:
+
+```
+# g.gdb
+set pagination off
+set breakpoint pending on
+break *iree_hal_device_queue_alloca
+commands
+silent
+printf "ALLOCA %lu\n", $rcx
+continue
+end
+run
+```
+
+```
+gdb -q -batch -x g.gdb --args iree-run-module --module=llama.vmfb ... --function=prefill_bs1 ...
+```
+
+`$rcx` is `allocation_size` at function entry (x86-64 SysV; the semaphore
+lists and params are passed in memory). The largest alloca after
+`EXEC @prefill_bs1` other than the 265,551,872 B logits buffer is the
+transient arena.
+
+## Open items
+
+- TM=8 needs `--iree-llvmcpu-stack-allocation-limit=131072` today. The pass
+  could choose TM against its own budget instead of the target default.
+- Decode (M=1) also goes through the rewrite; not measured.
