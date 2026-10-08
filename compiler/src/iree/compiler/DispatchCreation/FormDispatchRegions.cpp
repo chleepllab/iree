@@ -17,15 +17,18 @@
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "iree/compiler/DispatchCreation/FusionUtils.h"
 #include "iree/compiler/DispatchCreation/Passes.h"
+#include "iree/compiler/Utils/CustomFusion.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
@@ -64,6 +67,8 @@ using IREE::LinalgExt::getRootParallelLoopToOpMap;
 #ifdef MY_FUSION
 static constexpr StringLiteral kSpecialFusionAttr =
     "iree_dispatch.special_conv_chain";
+
+static constexpr StringLiteral kSpecialMLPAttr = "iree_dispatch.special_mlp";
 
 static bool isMaxPoolLikeGeneric(linalg::GenericOp op) {
   if (!op) return false;
@@ -664,17 +669,14 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
     if (source.getDefiningOp() != producer) {
       return false;
     }
-#ifdef MY_FUSION
-    // A multi-use source is fine here: the slice only writes into `dest`, so
-    // the producer's own result stays available and is simply yielded as an
-    // extra dispatch result.
+    // With conv chain fusion a multi-use source is fine here: the slice only
+    // writes into `dest`, so the producer's own result stays available and is
+    // simply yielded as an extra dispatch result.
     // Left unfused it becomes a whole extra `slow_memcpy` dispatch that re-reads
     // that result.
-#else
-    if (!source.hasOneUse()) {
+    if (!isConvChainFusionEnabled() && !source.hasOneUse()) {
       return false;
     }
-#endif // MY_FUSION
     // Fuse in `insert_slice` consumer operations if destination is a fill.
     // TODO: This can be generalized, but destination cannot be a
     // `arith.constant` or other constant-like objects. `linalg.fill` captures a
@@ -797,7 +799,7 @@ fuseRootsWithConsumers(MLIRContext *context, ArrayRef<Operation *> roots,
       // `getFusableUses` returns nothing for a value with more than one
       // distinct consumer, which hides the one consumer that is still worth
       // fusing there: the `insert_slice` of a pad.
-      if (fusableUses.empty()) {
+      if (isConvChainFusionEnabled() && fusableUses.empty()) {
         if (OpOperand *padUse = getPadInsertSliceUse(currRoot)) {
           if (padUse->getOwner()->getBlock() == currRoot->getBlock()) {
             fusableUses.push_back(padUse);
@@ -1080,6 +1082,100 @@ static bool tryFuseConvProducerChain(
 
   return fusedSpecialChain;
 }
+
+/// Returns `v`'s producer if it is a plain 2-D matmul -- one M, one N, one K
+/// dim, no batch -- looking through an elementwise `linalg.generic` that only
+/// truncates its result (the f32 accumulator -> f16 cast every matmul here
+/// ends with). `chain` collects the ops walked, producer last.
+static linalg::LinalgOp
+getMLPMatmulThroughTrunc(Value v, SmallVectorImpl<Operation *> &chain) {
+  Operation *def = v.getDefiningOp();
+  if (auto trunc = dyn_cast_or_null<linalg::GenericOp>(def)) {
+    if (trunc.getNumDpsInputs() != 1 || trunc.getNumDpsInits() != 1 ||
+        trunc.getNumLoops() != trunc.getNumParallelLoops() ||
+        !llvm::all_of(trunc.getIndexingMapsArray(),
+                      [](AffineMap m) { return m.isIdentity(); })) {
+      return nullptr;
+    }
+    Block *body = trunc.getBlock();
+    if (!llvm::hasNItems(*body, 2) ||
+        !isa<arith::TruncFOp>(body->front())) {
+      return nullptr;
+    }
+    chain.push_back(trunc);
+    def = trunc.getDpsInputs()[0].getDefiningOp();
+  }
+  auto matmul = dyn_cast_or_null<linalg::LinalgOp>(def);
+  if (!matmul || !linalg::isaContractionOpInterface(matmul) ||
+      matmul.getNumDpsInputs() != 2 || matmul.getNumDpsInits() != 1) {
+    return nullptr;
+  }
+  FailureOr<linalg::ContractionDimensions> dims =
+      linalg::inferContractionDims(matmul);
+  if (failed(dims) || !dims->batch.empty() || dims->m.size() != 1 ||
+      dims->n.size() != 1 || dims->k.size() != 1) {
+    return nullptr;
+  }
+  chain.push_back(matmul);
+  return matmul;
+}
+
+/// Matches the gated MLP whose down projection is `root`:
+///
+///   gate = trunc(x * Wg^T)            up = trunc(x * Wu^T)
+///   h    = silu(gate) * up             (one elementwise generic)
+///   root = h * Wd^T                    (+ its epilogue, fused as consumers)
+///
+/// and pulls `h`, both truncs and both matmuls into `root`'s group. Unfused,
+/// these are three dispatches per layer whose two [S, ffn] f16 results (`up`
+/// and `h`) round-trip through memory. Fusing them only pays off together with
+/// RewriteMLPChainAsForall, which produces `h` one ffn-chunk at a time; the
+/// stock tile-and-distribute would keep every op at full size.
+static bool tryFuseMLPChain(Operation *root, FusionGroup &fusionGroup,
+                            FusionTracker &tracker) {
+  SmallVector<Operation *> downChain;
+  auto down = dyn_cast<linalg::LinalgOp>(root);
+  if (!down || getMLPMatmulThroughTrunc(root->getResult(0), downChain) !=
+                   down) {
+    return false;
+  }
+  auto act = down.getDpsInputs()[0].getDefiningOp<linalg::GenericOp>();
+  if (!act || act.getNumDpsInputs() != 2 || act.getNumDpsInits() != 1 ||
+      act.getNumLoops() != act.getNumParallelLoops() ||
+      !llvm::all_of(act.getIndexingMapsArray(),
+                    [](AffineMap m) { return m.isIdentity(); }) ||
+      llvm::none_of(act.getBlock()->getOperations(),
+                    llvm::IsaPred<math::ExpOp>)) {
+    return false;
+  }
+
+  SmallVector<Operation *> chain = {act};
+  SmallVector<linalg::LinalgOp> projections;
+  for (Value input : act.getDpsInputs()) {
+    linalg::LinalgOp matmul = getMLPMatmulThroughTrunc(input, chain);
+    if (!matmul) {
+      return false;
+    }
+    projections.push_back(matmul);
+  }
+  // gate and up both project the same normalized activation.
+  if (projections[0].getDpsInputs()[0] != projections[1].getDpsInputs()[0] ||
+      projections[0] == projections[1]) {
+    return false;
+  }
+
+  DenseSet<Operation *> chainSet(chain.begin(), chain.end());
+  for (Operation *op : chain) {
+    if (op->getBlock() != root->getBlock() || tracker.isFusedOp(op) ||
+        tracker.isRootOp(op) || !isChainInternalOrDimUse(op, chainSet, root)) {
+      return false;
+    }
+  }
+  for (Operation *op : chain) {
+    tracker.appendToFusionGroup(op, fusionGroup);
+  }
+  return true;
+}
 #endif // MY_FUSION
 
 /// Starting from the `root` op, traverse the operand use-def chain
@@ -1169,12 +1265,17 @@ decideFusableLinalgOps(Region &region, DominanceInfo const &dominanceInfo,
       // If the current root is a convolution, attempt to fuse a preceding
       // conv -> (elementwise / insert_slice) -> conv chain into this group.
       bool fusedSpecialChain = false;
-      if (isConvLikeOp(&op)) {
+      if (isConvChainFusionEnabled() && isConvLikeOp(&op)) {
         fusedSpecialChain =
             tryFuseConvProducerChain(&op, newGroup, tracker, options);
       }
       if (fusedSpecialChain) {
         op.setAttr(kSpecialFusionAttr, UnitAttr::get(context));
+      }
+      // If the current root is the down projection of a gated MLP, pull the
+      // gate/up projections and the activation into the same dispatch.
+      if (isMLPFusionEnabled() && tryFuseMLPChain(&op, newGroup, tracker)) {
+        op.setAttr(kSpecialMLPAttr, UnitAttr::get(context));
       }
 #endif // MY_FUSION
       fuseRootsWithProducers(context, &op, newGroup, options, tracker,
@@ -1416,8 +1517,10 @@ createFusionGroups(TensorDimTrackingRewriter &rewriter,
   }
 
 #ifdef MY_FUSION
-  for (IREE::Flow::DispatchRegionOp regionOp : regionOps) {
-    dropDispatchResultsCoveredByPad(rewriter, regionOp);
+  if (isConvChainFusionEnabled()) {
+    for (IREE::Flow::DispatchRegionOp regionOp : regionOps) {
+      dropDispatchResultsCoveredByPad(rewriter, regionOp);
+    }
   }
 #endif // MY_FUSION
 

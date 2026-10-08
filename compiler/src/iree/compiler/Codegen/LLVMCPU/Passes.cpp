@@ -16,6 +16,7 @@
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/Transforms/Passes.h"
+#include "iree/compiler/Utils/CustomFusion.h"
 #include "iree/compiler/Utils/PassUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/CommandLine.h"
@@ -75,10 +76,17 @@ addTileAndDistributePasses(OpPassManager &funcPassManager,
     return;
   }
 #ifdef MY_PASS
-  funcPassManager.addPass(createRewriteConvChainAsForallPass());
-  funcPassManager.addPass(createRewriteConvMaxpoolAsForallPass());
-  funcPassManager.addPass(createCanonicalizerPass());
-  funcPassManager.addPass(createCSEPass());
+  if (isConvChainFusionEnabled()) {
+    funcPassManager.addPass(createRewriteConvChainAsForallPass());
+    funcPassManager.addPass(createRewriteConvMaxpoolAsForallPass());
+  }
+  if (isMLPFusionEnabled()) {
+    funcPassManager.addPass(createRewriteMLPChainAsForallPass());
+  }
+  if (isConvChainFusionEnabled() || isMLPFusionEnabled()) {
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+  }
 #endif
   funcPassManager.addPass(
       createTileAndDistributeToWorkgroupsUsingForallOpPass());
@@ -245,11 +253,14 @@ void addMultiTilingExpertPassPipeline(
   // fused chain with its full oh extent, hence undecomposed and unvectorized.
   // Tile the non-root ops' parallel dims too so both convs of the chain reach
   // the decomposition in the same shape.
-  funcPassManager.addPass(createLLVMCPUTilePass(
-      IREE::CPU::TilingLevel::VectorCommonParallelTiles, /*skipRootOp=*/true));
-  funcPassManager.addPass(createDecomposeConvolutionToLowerDimOpsPass());
-  funcPassManager.addPass(createFuseTensorPadWithConsumerPass());
-  funcPassManager.addPass(createConcretizePadResultShapePass());
+  if (isConvChainFusionEnabled()) {
+    funcPassManager.addPass(createLLVMCPUTilePass(
+        IREE::CPU::TilingLevel::VectorCommonParallelTiles,
+        /*skipRootOp=*/true));
+    funcPassManager.addPass(createDecomposeConvolutionToLowerDimOpsPass());
+    funcPassManager.addPass(createFuseTensorPadWithConsumerPass());
+    funcPassManager.addPass(createConcretizePadResultShapePass());
+  }
 #endif
 
   funcPassManager.addPass(createForallToForPass());

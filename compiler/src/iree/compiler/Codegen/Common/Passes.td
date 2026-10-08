@@ -1186,6 +1186,29 @@ def RewriteConvChainAsForallPass :
   ];
 }
 
+def RewriteMLPChainAsForallPass :
+    InterfacePass<"iree-codegen-rewrite-mlp-chain-as-forall",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Rewrite a fused gated MLP into one scf.forall over row tiles";
+
+  let description = [{
+    Matches the gate/up matmuls -> silu(gate) * up -> down matmul -> epilogue
+    dispatch formed under --iree-dispatch-creation-fuse-mlp (root tagged
+    `iree_dispatch.special_mlp`) and rewrites it into an scf.forall over row
+    tiles that accumulates the down projection over chunks of the ffn width,
+    so the [M, ffn] intermediates are never materialized. Rewritten functions
+    are tagged `iree_codegen.mlp_chain_rewritten` so later tiling skips them.
+  }];
+
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::iree_compiler::IREE::Codegen::IREECodegenDialect"
+  ];
+}
+
 def RewriteConvMaxpoolAsForallPass :
     InterfacePass<"iree-codegen-rewrite-conv-maxpool-as-forall",
                   "mlir::FunctionOpInterface"> {

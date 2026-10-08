@@ -159,6 +159,7 @@ iree_cc_library(
     "ResolveWorkgroupCountHints.cpp"
     "RewriteConvChainAsForall.cpp"
     "RewriteConvMaxpoolAsForall.cpp"
+    "RewriteMLPChainAsForall.cpp"
     "SMTConstraintUtils.cpp"
     "SpecializeExports.cpp"
     "SplitFullPartialTransfer.cpp"
