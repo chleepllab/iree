@@ -14,6 +14,7 @@
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "iree/compiler/Utils/RegionOpUtils.h"
+#include "iree/compiler/Utils/CustomFusion.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -883,7 +884,8 @@ static bool isUnfusableInit(OpOperand &operand) {
   Operation *op = operand.getOwner();
   if (auto insertSlice = dyn_cast<tensor::InsertSliceOp>(op)) {
 #ifdef MY_FUSION
-    if (isPaddedTemporaryInsertSlice(insertSlice)) {
+    if (isConvChainFusionEnabled() &&
+        isPaddedTemporaryInsertSlice(insertSlice)) {
       return false;
     }
 #endif // MY_FUSION
@@ -970,7 +972,8 @@ hasUnfusableUseInDispatch(Value v, Operation *dispatchOp,
     if (auto insertSlice = dyn_cast<tensor::InsertSliceOp>(user);
         insertSlice && use.get() == insertSlice.getDest()) {
 #ifdef MY_FUSION
-      if (isPaddedTemporaryInsertSlice(insertSlice)) {
+      if (isConvChainFusionEnabled() &&
+          isPaddedTemporaryInsertSlice(insertSlice)) {
         continue;
       }
 #endif // MY_FUSION

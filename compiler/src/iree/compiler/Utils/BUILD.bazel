@@ -35,6 +35,7 @@ iree_compiler_cc_library(
     name = "Utils",
     srcs = [
         "ConversionUtils.cpp",
+        "CustomFusion.cpp",
         "EncodingUtils.cpp",
         "EquivalenceUtils.cpp",
         "FlatbufferUtils.cpp",
@@ -50,6 +51,7 @@ iree_compiler_cc_library(
     ],
     hdrs = [
         "ConversionUtils.h",
+        "CustomFusion.h",
         "EmbeddedDataDirectory.h",
         "EncodingUtils.h",
         "EquivalenceUtils.h",

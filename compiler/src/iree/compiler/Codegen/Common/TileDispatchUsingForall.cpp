@@ -228,12 +228,15 @@ static bool isUsedAsInit(Operation *producer, Operation *user) {
 #ifdef MY_PASS
 static constexpr StringLiteral kConvChainRewrittenAttr =
     "iree_codegen.conv_chain_rewritten";
+static constexpr StringLiteral kMLPChainRewrittenAttr =
+    "iree_codegen.mlp_chain_rewritten";
 #endif // MY_PASS
 
 void TileAndDistributeToWorkgroupsUsingForallOpPass::runOnOperation() {
   mlir::FunctionOpInterface funcOp = getOperation();
 #ifdef MY_PASS
-  if (funcOp->hasAttr(kConvChainRewrittenAttr)) {
+  if (funcOp->hasAttr(kConvChainRewrittenAttr) ||
+      funcOp->hasAttr(kMLPChainRewrittenAttr)) {
     return;
   }
 #endif // MY_PASS

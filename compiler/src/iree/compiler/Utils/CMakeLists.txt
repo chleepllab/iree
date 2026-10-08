@@ -15,6 +15,7 @@ iree_cc_library(
     Utils
   HDRS
     "ConversionUtils.h"
+    "CustomFusion.h"
     "EmbeddedDataDirectory.h"
     "EncodingUtils.h"
     "EquivalenceUtils.h"
@@ -35,6 +36,7 @@ iree_cc_library(
     "TracingUtils.h"
   SRCS
     "ConversionUtils.cpp"
+    "CustomFusion.cpp"
     "EncodingUtils.cpp"
     "EquivalenceUtils.cpp"
     "FlatbufferUtils.cpp"
