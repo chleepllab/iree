@@ -27,6 +27,7 @@
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/Transforms/Passes.h"
+#include "iree/compiler/Utils/CustomFusion.h"
 #include "iree/compiler/Utils/PassUtils.h"
 #include "llvm/ADT/Repeated.h"
 #include "llvm/Support/Casting.h"
@@ -438,6 +439,13 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   // TODO (nirvedhmeshram) : Can remove this pass after
   // https://github.com/iree-org/iree/issues/19546 is fixed.
   funcPassManager.addPass(createConvertAccGEMMToGEMMPass());
+#ifdef MY_PASS
+  if (isMLPFusionEnabled()) {
+    funcPassManager.addPass(createGPURewriteMLPChainAsForallPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+  }
+#endif
   tileAndDistributeToWorkgroup(funcPassManager);
 
   // Step 0. Apply any user annotated lowering strategies. This runs first as

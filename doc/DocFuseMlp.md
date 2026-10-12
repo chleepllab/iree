@@ -138,6 +138,32 @@ Transient buffer size is captured at runtime with a gdb breakpoint on
   same 16 MiB transient saving. Max RSS is ~0.5–0.75 MiB above TM=2 from the
   larger per-thread stack buffers.
 
+### GX10 (aarch64)
+
+Host: ASUS GX10, Cortex-X925 + Cortex-A725 (20 cores), `--device=local-task`.
+Cross-compiled on x86 with `--iree-llvmcpu-target-triple=aarch64-unknown-linux-gnu
+--iree-llvmcpu-target-cpu=cortex-x925`; runtime-only build (gcc 13) on the
+GX10. Same model, function, S and KV cache as above.
+
+| LLaMA-3.2-1B f16, prefill S=512 | Baseline (32 KiB stack) | Custom fusion, TM=2 (32 KiB stack) | Baseline (128 KiB stack) | Custom fusion, TM=8 (128 KiB stack)* |
+|---|---:|---:|---:|---:|
+| Transient buffer (activations) | 45,353,344 B | 28,576,128 B | 45,353,344 B | 28,576,128 B |
+| Max RSS (3 runs) | 2,867,260–2,867,904 KB | 2,850,944–2,851,268 KB | 2,867,256–2,867,424 KB | 2,851,736–2,852,068 KB |
+| `HOST_LOCAL` peak | 265,551,872 B | 265,551,872 B | 265,551,872 B | 265,551,872 B |
+| `DEVICE_LOCAL` peak | 134,222,088 B | 134,222,088 B | 134,222,088 B | 134,222,088 B |
+| Minor page faults | ~759,660 | ~752,890 | ~759,760 | ~753,320 |
+| Wall time (3 runs) | 13.03–13.10 s | 17.46–17.64 s | 12.82–12.99 s | 17.08–17.17 s |
+| Output | — | bit-identical | bit-identical | bit-identical |
+
+\* Compiled with `--iree-llvmcpu-fail-on-large-vector=false`; see Open items.
+
+- Transient buffer: the same −16,777,216 B (−37.0%) as on x86, byte for byte.
+  Max RSS is ~16.1 MiB lower at TM=2 and ~15.6 MiB lower at TM=8.
+- Fused prefill is ~34% slower at TM=2 and ~32% slower at TM=8. Unlike x86,
+  TM=8 does not recover baseline speed.
+- The baseline itself is ~5.6x slower than on the 9950X (13 s vs 2.3 s), so
+  aarch64 f16 matmul codegen dominates; not investigated.
+
 ## Reproducing
 
 `~/workspace/run_llama.sh [SEQ_LEN]` compiles and runs prefill + decode; add

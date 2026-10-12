@@ -1209,6 +1209,35 @@ def RewriteMLPChainAsForallPass :
   ];
 }
 
+def GPURewriteMLPChainAsForallPass :
+    InterfacePass<"iree-codegen-gpu-rewrite-mlp-chain-as-forall",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "GPU variant of RewriteMLPChainAsForall for the TileAndFuse "
+                "pipeline";
+
+  let description = [{
+    Same rewrite as RewriteMLPChainAsForall (a workgroup scf.forall over row
+    tiles, the down projection accumulated over chunks of the ffn width), for
+    the LLVMGPU TileAndFuse pipeline. The chain is matched by structure, since
+    the `iree_dispatch.special_mlp` tag does not reach GPU codegen, and in any
+    rank (the GPU dispatch splits M into [D, 32]). Every op inside the
+    workgroup forall is then distributed to threads on its own, so the
+    [TM, N] accumulator and the gate/up/h chunks become shared memory, and the
+    row tile is sized against the target's workgroup memory. Rewritten
+    functions are tagged `iree_codegen.mlp_chain_rewritten` so later tiling
+    skips them.
+  }];
+
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::gpu::GPUDialect",
+    "mlir::iree_compiler::IREE::Codegen::IREECodegenDialect"
+  ];
+}
+
 def RewriteConvMaxpoolAsForallPass :
     InterfacePass<"iree-codegen-rewrite-conv-maxpool-as-forall",
                   "mlir::FunctionOpInterface"> {

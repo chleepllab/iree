@@ -176,6 +176,12 @@ void populateDecomposeMemrefsPatterns(RewritePatternSet &patterns);
 void populateForOpInductionVarShapePatterns(RewritePatternSet &,
                                             PatternBenefit = 1);
 
+/// True if `op` is the down projection of a gated MLP chain (gate/up
+/// projections -> silu(gate) * up -> down -> elementwise epilogue) that
+/// GPURewriteMLPChainAsForall rewrites. LLVMGPU config selection uses it to
+/// send such dispatches to the TileAndFuse pipeline.
+bool isGatedMLPChainDown(Operation *op);
+
 //----------------------------------------------------------------------------//
 // Register CodeGen Common Passes
 //----------------------------------------------------------------------------//
