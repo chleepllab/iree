@@ -123,6 +123,8 @@ iree_cc_library(
     "ROCDLPrefetching.cpp"
     "ROCDLPrepareForSPIRV.cpp"
     "Verifiers.cpp"
+  COPTS
+    "-DMY_PASS"
   DEPS
     ::LLVMGPUConstraintGenerator
     ::PassHeaders

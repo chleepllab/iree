@@ -12,6 +12,7 @@
 
 #include "compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUSelectUKernels.h"
 #include "iree/compiler/Codegen/Common/GPU/GPUHeuristics.h"
+#include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/GPULoweringConfigUtils.h"
@@ -28,6 +29,7 @@
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
+#include "iree/compiler/Utils/CustomFusion.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/SmallVectorExtras.h"
@@ -2404,6 +2406,18 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
     computeOp->print(llvm::dbgs(), OpPrintingFlags().skipRegions());
     llvm::dbgs() << "\n";
   });
+#ifdef MY_PASS
+  // A gated MLP chain is codegen'd by GPURewriteMLPChainAsForall, which runs in
+  // the TileAndFuse pipeline and replaces the configs. Without this, M=1
+  // (decode) would go to VectorDistribute and never reach it.
+  if (isMLPFusionEnabled() && isGatedMLPChainDown(computeOp)) {
+    if (succeeded(IREE::GPU::setTileAndFuseLoweringConfig(target, entryPointFn,
+                                                          computeOp))) {
+      LDBG() << "Tile and fuse config for gated MLP chain";
+      return success();
+    }
+  }
+#endif
   if (succeeded(setDataTiledMmaInnerTiledLoweringConfig(
           target, entryPointFn, computeOp, ukernelConfig,
           clPrefetchNumStages))) {
