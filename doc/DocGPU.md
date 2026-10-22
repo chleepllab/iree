@@ -98,7 +98,7 @@ The fusion stops the two [512, 8192] f16 tensors (gate and up) from being
 | Decode wall time (3 runs) | 1.04–1.11 s | 1.19–1.27 s |
 | Prefill logits vs baseline | — | max \|Δ\| 0.047, mean \|Δ\| 0.0019, top-1 100% |
 | Decode logits vs baseline | — | max \|Δ\| 0.0039, mean \|Δ\| 0.0003, top-1 100% |
-| vmfb size | 677,389 B | 741,933 B |
+| vmfb size | 677,389 B | 669,629 B |
 
 \* Captured with gdb on a prefill-only build of the module (`decode_bs1`
 removed); the full module's `DEVICE_LOCAL` peak drops by the same 16 MiB.
@@ -117,6 +117,35 @@ removed); the full module's `DEVICE_LOCAL` peak drops by the same 16 MiB.
   are 1.9 s / 2.75 s and are left out). Fused prefill compute is ~0.9 s
   slower: the rewrite uses per-thread FMAs, the baseline matmuls use
   `NV_MMA_SYNC_F32_16x8x16_F16`.
+
+### Prefill length S
+
+Same setup, `prefill_bs1` at S=1024 and S=2048 (64 of the 128 KV pages). The
+S=512 column repeats the table above. Transient sizes at S=1024/2048 are from
+gdb on the full module; times and RSS are all 3 runs.
+
+| LLaMA-3.2-1B f16 prefill on GB10 | S=512 | S=1024 | S=2048 |
+|---|---:|---:|---:|
+| Transient buffer, baseline | 45,353,344 B | 125,309,696 B | 389,031,424 B |
+| Transient buffer, fused | 28,576,128 B (−16 MiB, −37.0%) | 91,755,264 B (−32 MiB, −26.8%) | 321,922,560 B (−64 MiB, −17.3%) |
+| `DEVICE_LOCAL` peak, baseline | 2,916,891,272 B | 3,128,185,992 B | 3,654,584,456 B |
+| `DEVICE_LOCAL` peak, fused | 2,900,114,056 B (−16,777,216 B) | 3,094,631,560 B (−33,554,432 B) | 3,587,475,592 B (−67,108,864 B) |
+| `HOST_LOCAL` peak (both) | 265,551,872 B | 396,886,016 B | 659,554,304 B |
+| Max RSS, baseline | 377,528–377,704 KB | 505,872–506,064 KB | 762,404–762,676 KB |
+| Max RSS, fused | 377,484–377,508 KB | 505,784–506,020 KB | 762,196–762,280 KB |
+| Wall time, baseline | 1.38–1.45 s | 1.79 s | 3.07–3.11 s |
+| Wall time, fused | 2.26–2.29 s | 3.33–3.35 s | 6.02–6.10 s |
+| Logits vs baseline | max \|Δ\| 0.047, mean 0.0019, top-1 100% | max \|Δ\| 0.047, mean 0.0017, top-1 100% | max \|Δ\| 0.051, mean 0.0017, top-1 99.66% |
+
+- The saving is 2 × S × 8192 × 2 B (`gate` and `up` in f16), linear in S, and
+  the `DEVICE_LOCAL` peak drops by exactly that much at every S.
+- The baseline transient grows faster than S (2.8x from 512 to 1024, 3.1x
+  from 1024 to 2048), so the relative saving shrinks: −37.0%, −26.8%, −17.3%.
+- S=2048 top-1: 7 of 2048 positions pick a different token. All 7 are ties in
+  the baseline logits (top-1/top-2 gap 0 or 0.0039, one f16 step at ~6;
+  median gap over all positions 0.25).
+- Fused prefill wall time is 1.6x, 1.9x and 2.0x the baseline at S=512, 1024
+  and 2048 (per-thread FMAs vs MMA; the ~1 s start-up is included).
 
 ## Reproducing
 

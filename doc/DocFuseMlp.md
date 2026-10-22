@@ -164,6 +164,35 @@ GX10. Same model, function, S and KV cache as above.
 - The baseline itself is ~5.6x slower than on the 9950X (13 s vs 2.3 s), so
   aarch64 f16 matmul codegen dominates; not investigated.
 
+### Banana Pi BPI-F3 (riscv64)
+
+Host: SpacemiT K1, 8x SpacemiT X60 (RVV 1.0, VLEN 256), `--device=local-task`.
+Cross-compiled on x86 with `--iree-llvmcpu-target-triple=riscv64
+--iree-llvmcpu-target-abi=lp64d
+--iree-llvmcpu-target-cpu-features=+m,+a,+f,+d,+zvl256b,+v,+zfh,+zvfh` and
+`--iree-llvmcpu-stack-allocation-limit=131072`; runtime from
+`~/iree_c-build-riscv`. Same model, function, S and KV cache as above. One run
+each (a prefill takes 21–27 minutes).
+
+| LLaMA-3.2-1B f16, prefill S=512 | Baseline (128 KiB stack) | Custom fusion, TM=8 (128 KiB stack) |
+|---|---:|---:|
+| Transient buffer (activations) | 45,353,344 B | 28,576,128 B (−16 MiB) |
+| Max RSS | 2,858,624 KB | 2,842,496 KB (−15.7 MiB) |
+| `HOST_LOCAL` peak | 265,551,872 B | 265,551,872 B |
+| `DEVICE_LOCAL` peak | 134,222,088 B | 134,222,088 B |
+| Minor page faults | 814,438 | 806,552 |
+| Wall time | 1,643 s (27.4 min) | 1,277 s (21.3 min, −22%) |
+| Output | — | bit-identical |
+
+- Transient buffer: the same −16,777,216 B (−37.0%) as on x86 and aarch64.
+  Max RSS is ~15.7 MiB lower.
+- Unlike x86 and aarch64, fused prefill is faster than the baseline here
+  (−366 s); not investigated.
+- TM=8 compiles without `--iree-llvmcpu-fail-on-large-vector=false` on this
+  target.
+- gdb: `allocation_size` is in `$a6` (RISC-V LP64D; the semaphore lists and
+  params are passed by reference, as on aarch64 where it is `$x6`).
+
 ## Reproducing
 
 `~/workspace/run_llama.sh [SEQ_LEN]` compiles and runs prefill + decode; add
