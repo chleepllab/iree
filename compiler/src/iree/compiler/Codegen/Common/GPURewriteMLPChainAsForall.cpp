@@ -51,6 +51,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -69,6 +70,13 @@ namespace mlir::iree_compiler {
 
 #define GEN_PASS_DEF_GPUREWRITEMLPCHAINASFORALLPASS
 #include "iree/compiler/Codegen/Common/Passes.h.inc"
+
+static llvm::cl::opt<int64_t> clMLPRowTile(
+    "iree-codegen-gpu-mlp-row-tile",
+    llvm::cl::desc("Row tile (TM) for GPURewriteMLPChainAsForall; 0 picks the "
+                   "largest one whose buffers fit in half of the target's "
+                   "max_workgroup_memory_bytes."),
+    llvm::cl::init(0), llvm::cl::Hidden);
 
 namespace {
 
@@ -200,6 +208,10 @@ static FailureOr<MLPChainMatch> matchMLPChain(Operation *downCandidate,
 /// 9.25 KiB for llama's N = 2048, so sm_121's 99 KiB gives 4 rows.
 static int64_t pickRowTile(FunctionOpInterface funcOp, int64_t n,
                            int64_t mInner) {
+  if (clMLPRowTile > 0 &&
+      (ShapedType::isDynamic(mInner) || mInner % clMLPRowTile == 0)) {
+    return clMLPRowTile;
+  }
   int64_t limit = kDefaultWorkgroupMemoryBytes;
   if (IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp)) {
     limit = target.getWgp().getMaxWorkgroupMemoryBytes();

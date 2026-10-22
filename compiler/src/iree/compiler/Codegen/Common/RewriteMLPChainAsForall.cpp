@@ -25,12 +25,14 @@
 // The forall tiles only M, so each workgroup computes gate/up exactly once for
 // its rows (tiling N as well would recompute them once per N tile). The price
 // is the [TM, N] f32 accumulator, which lives on the stack across the F loop:
-// TM is picked as the largest row tile whose accumulator and chunk buffers fit
-// the target's `max_stack_allocation_size` (32 KiB unless raised with
-// --iree-llvmcpu-stack-allocation-limit).
+// TM is picked as the largest power-of-two row tile, at most the root's
+// distribution M size, whose accumulator and chunk buffers fit the target's
+// `max_stack_allocation_size` (32 KiB unless raised with
+// --iree-llvmcpu-stack-allocation-limit). TF is the root's cache_reduction size
+// when it has one, else 128.
 //
-// Every op is then tiled on its own to vector-sized pieces and its
-// lowering_config is dropped. The vector-level tile-and-fuse passes that
+// Every op is then tiled on its own to the vector sizes in its lowering_config
+// (falling back to the root's) and its lowering_config is dropped. The vector-level tile-and-fuse passes that
 // follow would otherwise anchor on `down` and fuse `h` (and gate/up behind it)
 // into each of down's N tiles -- recomputing the whole chunk N / 16 times. With
 // no config left they find no anchor, and GenericVectorization infers the
@@ -41,10 +43,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Codegen/Dialect/CPU/IR/IREECPUTypes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
@@ -55,6 +60,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
+
+#include <numeric>
 
 #define DEBUG_TYPE "rewrite-mlp-chain-as-forall"
 
@@ -69,14 +76,15 @@ static constexpr StringLiteral kSpecialMLPAttr = "iree_dispatch.special_mlp";
 static constexpr StringLiteral kMLPChainRewrittenAttr =
     "iree_codegen.mlp_chain_rewritten";
 
-// Vector tile of every matmul and elementwise op once everything is tiled:
-// [kVecM, kVecN] outputs over a kVecK reduction step. Matches the
-// vector_common_parallel / vector_reduction sizes KernelDispatch picks for
-// these f16 matmuls on RVV and AVX-512.
+// Fallback vector tile of every matmul and elementwise op, used for the loops
+// an op's lowering_config does not size (and for ops without one): [kVecM,
+// kVecN] outputs over a kVecK reduction step. These are the sizes
+// KernelDispatch picks for these f16 matmuls on AVX-512.
 static constexpr int64_t kVecM = 8;
 static constexpr int64_t kVecN = 16;
 static constexpr int64_t kVecK = 16;
-// F-chunk the down projection is accumulated over.
+// F-chunk the down projection is accumulated over, unless the root's
+// lowering_config has a cache_reduction size for it.
 static constexpr int64_t kFfnChunk = 128;
 // Used when the target does not say (same default as the CPU backend).
 static constexpr int64_t kDefaultStackLimitBytes = 32 * 1024;
@@ -164,12 +172,57 @@ static FailureOr<MLPChainMatch> matchMLPChain(Operation *root,
   return match;
 }
 
-/// Largest power-of-two row tile (at most kVecM) whose stack buffers fit in
-/// 3/4 of the limit, leaving the rest for spills and the callee frames. Per
-/// row: the [., N] f32 accumulator plus the [., kFfnChunk] gate/up (f32) and h
-/// (f16) chunks -- which is what bufferization allocates (9.25 KiB per row for
-/// llama's N = 2048). 32 KiB gives 2 rows; 128 KiB gives the full kVecM.
-static int64_t pickRowTile(FunctionOpInterface funcOp, int64_t n) {
+/// Size of `op`'s lowering_config at `level` for each loop (0 = not tiled), or
+/// an empty list if the config does not have that level.
+static SmallVector<int64_t> getConfigLevel(Operation *op,
+                                           IREE::CPU::TilingLevel level) {
+  auto config = getLoweringConfig<IREE::CPU::LoweringConfigAttr>(op);
+  if (!config || !config.hasTilingLevel(llvm::to_underlying(level))) {
+    return {};
+  }
+  return config.getStaticTilingLevelSizes(llvm::to_underlying(level), op);
+}
+
+/// Vector tile size of each of `op`'s loops from its lowering_config: the
+/// vector_common_parallel size, else vector_inner_parallel, else
+/// vector_reduction. Loops none of them size get `fallback`.
+static SmallVector<int64_t> getVectorTileSizes(Operation *op,
+                                               ArrayRef<int64_t> fallback) {
+  SmallVector<int64_t> sizes(fallback);
+  SmallVector<bool> fromConfig(sizes.size(), false);
+  for (IREE::CPU::TilingLevel level :
+       {IREE::CPU::TilingLevel::VectorCommonParallelTiles,
+        IREE::CPU::TilingLevel::VectorInnerParallelTiles,
+        IREE::CPU::TilingLevel::VectorReductionTiles}) {
+    for (auto [i, size] : llvm::enumerate(getConfigLevel(op, level))) {
+      if (i < sizes.size() && !fromConfig[i] && size > 0 &&
+          !ShapedType::isDynamic(size)) {
+        sizes[i] = size;
+        fromConfig[i] = true;
+      }
+    }
+  }
+  return sizes;
+}
+
+/// Size `level` of `op`'s lowering_config gives loop `dim`, or 0.
+static int64_t getConfigSize(Operation *op, IREE::CPU::TilingLevel level,
+                             unsigned dim) {
+  SmallVector<int64_t> sizes = getConfigLevel(op, level);
+  if (dim >= sizes.size() || ShapedType::isDynamic(sizes[dim])) {
+    return 0;
+  }
+  return sizes[dim];
+}
+
+/// Largest power-of-two row tile, at most `maxRows` (the root's distribution
+/// M size), whose stack buffers fit in 3/4 of the limit, leaving the rest for
+/// spills and the callee frames. Per row: the [., N] f32 accumulator plus the
+/// [., ffnChunk] gate/up (f32) and h (f16) chunks -- which is what
+/// bufferization allocates (9.25 KiB per row for llama's N = 2048 and a 128
+/// chunk). 32 KiB gives 2 rows; 128 KiB gives 8.
+static int64_t pickRowTile(FunctionOpInterface funcOp, int64_t n,
+                           int64_t maxRows, int64_t ffnChunk) {
   int64_t limit = kDefaultStackLimitBytes;
   if (auto target = IREE::HAL::ExecutableTargetAttr::lookup(funcOp)) {
     if (DictionaryAttr config = target.getConfiguration()) {
@@ -179,8 +232,8 @@ static int64_t pickRowTile(FunctionOpInterface funcOp, int64_t n) {
       }
     }
   }
-  int64_t bytesPerRow = n * 4 + kFfnChunk * (4 + 4 + 2);
-  int64_t rows = kVecM;
+  int64_t bytesPerRow = n * 4 + ffnChunk * (4 + 4 + 2);
+  int64_t rows = llvm::PowerOf2Ceil(maxRows);
   while (rows > 1 && rows * bytesPerRow > limit / 4 * 3) {
     rows /= 2;
   }
@@ -249,8 +302,29 @@ static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
   if (ShapedType::isDynamic(n)) {
     return failure();
   }
-  int64_t rowTile = pickRowTile(funcOp, n);
-  LLVM_DEBUG(llvm::dbgs() << "[mlp] row tile " << rowTile << "\n");
+  // Tile sizes come from the root's lowering_config where it has them.
+  SmallVector<int64_t> rootVec =
+      getVectorTileSizes(match.down, {kVecM, kVecN, kVecK});
+  int64_t vecK = rootVec[2];
+  SmallVector<int64_t> gateVec =
+      getVectorTileSizes(match.gate, {kVecM, kVecN, vecK});
+  int64_t maxRows = getConfigSize(
+      match.down, IREE::CPU::TilingLevel::DistributionTiles, /*dim=*/0);
+  if (maxRows <= 0) {
+    maxRows = kVecM;
+  }
+  int64_t ffnChunk = getConfigSize(
+      match.down, IREE::CPU::TilingLevel::CacheReductionTiles, /*dim=*/2);
+  if (ffnChunk <= 0) {
+    ffnChunk = kFfnChunk;
+  }
+  // Whole vector tiles of both down's reduction and gate/up's F (= N) dim.
+  int64_t chunkMultiple = std::lcm(vecK, gateVec[1]);
+  ffnChunk = llvm::divideCeil(ffnChunk, chunkMultiple) * chunkMultiple;
+  int64_t rowTile = pickRowTile(funcOp, n, maxRows, ffnChunk);
+  LLVM_DEBUG(llvm::dbgs() << "[mlp] row tile " << rowTile << ", ffn chunk "
+                          << ffnChunk << ", vector tile " << rootVec[0] << "x"
+                          << rootVec[1] << "x" << vecK << "\n");
 
   // 1. Workgroups: tile the epilogue over M only and fuse the whole chain in.
   {
@@ -309,7 +383,7 @@ static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
   {
     scf::SCFTilingOptions tilingOptions;
     tilingOptions.setTileSizes(
-        getAsIndexOpFoldResult(ctx, ArrayRef<int64_t>{0, 0, kFfnChunk}));
+        getAsIndexOpFoldResult(ctx, ArrayRef<int64_t>{0, 0, ffnChunk}));
     scf::SCFTileAndFuseOptions options;
     options.setTilingOptions(tilingOptions);
     Operation *gate = tiled.gate, *up = tiled.up, *act = tiled.act;
@@ -349,7 +423,8 @@ static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
   }
 
   // 3. Tile every op left in the forall to vector size on its own, and drop
-  // its lowering_config (see the file comment).
+  // its lowering_config (see the file comment). The sizes are read from that
+  // config first; the clones keep the original op's.
   SmallVector<linalg::LinalgOp> ops;
   forallOp.walk([&](linalg::LinalgOp op) {
     if (!op->use_empty()) {
@@ -357,14 +432,15 @@ static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
     }
   });
   for (linalg::LinalgOp op : ops) {
-    op->removeAttr("lowering_config");
-    op->removeAttr(kSpecialMLPAttr);
     SmallVector<int64_t> sizes;
     if (op.getNumLoops() == 3) {
-      sizes = {kVecM, kVecN, kVecK};
+      sizes = getVectorTileSizes(op, {rootVec[0], rootVec[1], vecK});
     } else if (op.getNumLoops() == 2) {
-      sizes = {kVecM, kVecN};
-    } else {
+      sizes = getVectorTileSizes(op, {rootVec[0], rootVec[1]});
+    }
+    op->removeAttr("lowering_config");
+    op->removeAttr(kSpecialMLPAttr);
+    if (sizes.empty()) {
       continue;
     }
     if (failed(tileAlone(rewriter, cast<TilingInterface>(op.getOperation()),
