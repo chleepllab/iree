@@ -501,8 +501,25 @@ LogicalResult applyTileAndFuseToEachRoot(
       Operation *parentOp =
           tiledResults->loops.front().getOperation()->getParentOp();
       scf::ForOp parentForOp = dyn_cast<scf::ForOp>(parentOp);
+      // Only a perfect nest can be coalesced: the parent holds just the new
+      // loop and yields its results, and the new loop starts from the
+      // parent's iter_args (coalesceLoops asserts this). A parent that does
+      // other work too (e.g. the F-chunk loop of the fused MLP rewrite, with
+      // up, h and down beside gate) is left alone.
       if (parentForOp) {
-        forLoops.push_back(parentForOp);
+        auto innerFor = dyn_cast<scf::ForOp>(
+            tiledResults->loops.front().getOperation());
+        Block *body = parentForOp.getBody();
+        bool isPerfectNest =
+            innerFor && body->getOperations().size() == 2 &&
+            &body->front() == innerFor.getOperation() &&
+            llvm::equal(parentForOp.getRegionIterArgs(),
+                        innerFor.getInitArgs()) &&
+            llvm::equal(body->getTerminator()->getOperands(),
+                        innerFor.getResults());
+        if (isPerfectNest) {
+          forLoops.push_back(parentForOp);
+        }
       }
 
       // Collect all the tiled loops first.

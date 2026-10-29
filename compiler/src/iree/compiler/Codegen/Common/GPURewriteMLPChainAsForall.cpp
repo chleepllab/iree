@@ -42,6 +42,14 @@
 //   TileAndFuse steps (operand promotion, packing to MMA intrinsics, the
 //   reduction/thread/subgroup tiling levels) find nothing to act on.
 //
+// MMA path (--iree-codegen-gpu-mlp-mma, the default when the inner M dim is a
+// multiple of 16, i.e. prefill): TM is one intrinsic (16 rows) and N is also
+// split across workgroups (--iree-codegen-gpu-mlp-mma-n-tile), so the
+// [16, nTile] accumulator fits in shared memory; gate/up are recomputed once
+// per N tile. Instead of the thread distribution above, gate, up and down get
+// MMA lowering configs and h a thread config, and the TileAndFuse levels lower
+// them: each op has its own config, so none is fused into another.
+//
 // The function is tagged `iree_codegen.mlp_chain_rewritten` so
 // TileAndDistributeToWorkgroupsUsingForall leaves it alone.
 //===----------------------------------------------------------------------===//
@@ -49,6 +57,7 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/GPULoweringConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "llvm/Support/CommandLine.h"
@@ -78,6 +87,31 @@ static llvm::cl::opt<int64_t> clMLPRowTile(
                    "max_workgroup_memory_bytes."),
     llvm::cl::init(0), llvm::cl::Hidden);
 
+static llvm::cl::opt<bool> clMLPUseMMA(
+    "iree-codegen-gpu-mlp-mma",
+    llvm::cl::desc("Lower the projections of the rewritten MLP chain with MMA "
+                   "intrinsics (TM = 16, N split across workgroups) instead of "
+                   "per-thread FMAs."),
+    llvm::cl::init(true), llvm::cl::Hidden);
+
+static llvm::cl::opt<int64_t> clMLPMMANTile(
+    "iree-codegen-gpu-mlp-mma-n-tile",
+    llvm::cl::desc("Workgroup tile along N for --iree-codegen-gpu-mlp-mma. "
+                   "gate/up are recomputed once per N tile."),
+    llvm::cl::init(512), llvm::cl::Hidden);
+
+static llvm::cl::opt<int64_t> clMLPMMAReductionK(
+    "iree-codegen-gpu-mlp-mma-reduction-k",
+    llvm::cl::desc("K tile, in intrinsics, gate/up are reduced in on the "
+                   "--iree-codegen-gpu-mlp-mma path."),
+    llvm::cl::init(2), llvm::cl::Hidden);
+
+static llvm::cl::opt<bool> clMLPMMAPromote(
+    "iree-codegen-gpu-mlp-mma-promote",
+    llvm::cl::desc("Promote gate/up's operands (x and the weight tile) to "
+                   "shared memory on the --iree-codegen-gpu-mlp-mma path."),
+    llvm::cl::init(true), llvm::cl::Hidden);
+
 namespace {
 
 static constexpr StringLiteral kMLPChainRewrittenAttr =
@@ -98,6 +132,8 @@ static constexpr int64_t kDefaultWorkgroupMemoryBytes = 48 * 1024;
 // Threads per workgroup. Every op is distributed over all of them, so this
 // replaces whatever size config selection picked for the root op.
 static constexpr int64_t kWorkgroupThreads = 256;
+// MMA path: rows per workgroup (one intrinsic M tile).
+static constexpr int64_t kMMARowTile = 16;
 
 struct MLPChainMatch {
   linalg::LinalgOp gate;
@@ -376,6 +412,93 @@ static LogicalResult distributeToThreads(RewriterBase &rewriter,
   return success();
 }
 
+/// Lowering config for a projection inside the F loop: packed to `kind`, each
+/// subgroup taking one intrinsic along M and `subgroupN` along N, and the K dim
+/// tiled to `reductionK` intrinsics (0: left whole).
+static IREE::GPU::LoweringConfigAttr
+getProjectionMMAConfig(MLIRContext *ctx, IREE::GPU::MMAAttr kind,
+                       int64_t numLoops, int64_t subgroupN, int64_t reductionK,
+                       bool promote) {
+  Builder b(ctx);
+  SmallVector<NamedAttribute> attrs;
+  IREE::GPU::setMmaKind(ctx, attrs, kind);
+  if (promote) {
+    IREE::GPU::appendPromotedOperandsList(ctx, attrs, {0, 1});
+  }
+  SmallVector<int64_t> subgroup(numLoops, 0);
+  subgroup[numLoops - 3] = 1;
+  subgroup[numLoops - 2] = subgroupN;
+  attrs.emplace_back("subgroup", b.getI64ArrayAttr(subgroup));
+  if (reductionK > 0) {
+    SmallVector<int64_t> reduction(numLoops, 0);
+    reduction[numLoops - 1] = reductionK;
+    attrs.emplace_back("reduction", b.getI64ArrayAttr(reduction));
+  }
+  return IREE::GPU::LoweringConfigAttr::get(ctx,
+                                            DictionaryAttr::get(ctx, attrs));
+}
+
+/// MMA path for step 3: instead of distributing every op to threads here,
+/// give gate, up and down MMA configs and h a thread config, and let the
+/// TileAndFuse levels lower them. Each op has its own config at the level it
+/// is tiled at, so none is fused into another (GPUApplyTilingLevel only fuses
+/// producers without one): h is computed once per chunk, not once per down
+/// subgroup tile. The fills and the epilogue are left to
+/// GPUGreedilyDistributeToThreads.
+static LogicalResult setMMAConfigs(scf::ForallOp forallOp,
+                                   IREE::GPU::MMAAttr kind, int64_t nTile,
+                                   int64_t numSubgroups) {
+  MLIRContext *ctx = forallOp.getContext();
+  linalg::LinalgOp down;
+  forallOp.walk([&](linalg::LinalgOp op) {
+    if (op->hasAttr(kMLPDownAttr) && op->getParentOfType<scf::ForOp>()) {
+      down = op;
+    }
+  });
+  if (!down) {
+    return failure();
+  }
+  auto act = down.getDpsInputs()[0].getDefiningOp<linalg::GenericOp>();
+  if (!act || act.getNumDpsInputs() != 2) {
+    return failure();
+  }
+  auto gate = act.getDpsInputs()[0].getDefiningOp<linalg::LinalgOp>();
+  auto up = act.getDpsInputs()[1].getDefiningOp<linalg::LinalgOp>();
+  if (!gate || !up) {
+    return failure();
+  }
+  auto [intrinsicM, intrinsicN, intrinsicK] = kind.getMNKShape();
+  (void)intrinsicK;
+  int64_t chunkTilesN = kFfnChunk / intrinsicN;
+  int64_t downTilesN = nTile / intrinsicN;
+  if (intrinsicM != kMMARowTile || chunkTilesN % numSubgroups != 0 ||
+      downTilesN % numSubgroups != 0) {
+    return failure();
+  }
+  int64_t numLoops = down.getNumLoops();
+  for (linalg::LinalgOp proj : {gate, up}) {
+    setLoweringConfig(proj, getProjectionMMAConfig(
+                                ctx, kind, numLoops, chunkTilesN / numSubgroups,
+                                clMLPMMAReductionK, clMLPMMAPromote));
+  }
+  setLoweringConfig(down, getProjectionMMAConfig(ctx, kind, numLoops,
+                                                 downTilesN / numSubgroups,
+                                                 /*reductionK=*/0,
+                                                 /*promote=*/false));
+  down->removeAttr(kMLPDownAttr);
+
+  // h: [., kMMARowTile, kFfnChunk] over the workgroup's threads, 8 wide.
+  Builder b(ctx);
+  SmallVector<int64_t> thread(act.getNumLoops(), 0);
+  thread[act.getNumLoops() - 2] = 1;
+  thread[act.getNumLoops() - 1] = 8;
+  SmallVector<NamedAttribute> attrs;
+  attrs.emplace_back("thread", b.getI64ArrayAttr(thread));
+  setLoweringConfig(act, IREE::GPU::LoweringConfigAttr::get(
+                             ctx, DictionaryAttr::get(ctx, attrs)));
+  return success();
+}
+
 static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
                                      FunctionOpInterface funcOp,
                                      MLPChainMatch &match) {
@@ -404,18 +527,39 @@ static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
                   ctx, info.getPassPipeline(), info.getCodegenSpec(),
                   ArrayRef<int64_t>{numThreads, 1, 1}, info.getSubgroupSize(),
                   info.getConfiguration()));
-  int64_t rowTile = pickRowTile(funcOp, n, outType.getDimSize(rank - 2));
+  int64_t mInner = outType.getDimSize(rank - 2);
+  int64_t rowTile = pickRowTile(funcOp, n, mInner);
+  // MMA path: one intrinsic of rows, and N split so the [TM, nTile] f32
+  // accumulator plus the chunk buffers fit in workgroup memory.
+  auto mmaKind = IREE::GPU::MMAAttr::get(
+      ctx, IREE::GPU::MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_F16);
+  int64_t nTile = clMLPMMANTile;
+  int64_t subgroupSize = info.getSubgroupSize() ? info.getSubgroupSize() : 32;
+  bool useMMA = clMLPUseMMA && !ShapedType::isDynamic(mInner) &&
+                mInner % kMMARowTile == 0 && nTile > 0 && n % nTile == 0 &&
+                numThreads % subgroupSize == 0;
+  if (useMMA) {
+    int64_t limit = kDefaultWorkgroupMemoryBytes;
+    if (IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp)) {
+      limit = target.getWgp().getMaxWorkgroupMemoryBytes();
+    }
+    useMMA = kMMARowTile * (nTile * 4 + kFfnChunk * (4 + 4 + 2)) <= limit;
+  }
+  if (useMMA) {
+    rowTile = kMMARowTile;
+  }
   LLVM_DEBUG(llvm::dbgs() << "[mlp] row tile " << rowTile << ", threads "
-                          << numThreads << "\n");
+                          << numThreads << (useMMA ? ", mma" : "") << "\n");
 
   match.down->setAttr(kMLPDownAttr, UnitAttr::get(ctx));
 
-  // 1. Workgroups: tile the epilogue over the M dims only (the outer ones to
-  // 1, the innermost to the row tile) and fuse the whole chain in.
+  // 1. Workgroups: tile the epilogue over the M dims (the outer ones to 1, the
+  // innermost to the row tile), and on the MMA path over N, and fuse the whole
+  // chain in.
   {
     SmallVector<int64_t> tileSizes(rank, 1);
     tileSizes[rank - 2] = rowTile;
-    tileSizes[rank - 1] = 0;
+    tileSizes[rank - 1] = useMMA ? nTile : 0;
     scf::SCFTilingOptions tilingOptions;
     tilingOptions.setTileSizes(getAsIndexOpFoldResult(ctx, tileSizes));
     tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
@@ -509,7 +653,18 @@ static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
     rewriter.replaceAllUsesWith(tiled.down->getResult(0), repl);
   }
 
-  // 3. Distribute every op left in the workgroup forall to threads on its own.
+  // 3. MMA path: configs for the TileAndFuse levels.
+  if (useMMA) {
+    if (failed(setMMAConfigs(forallOp, mmaKind, nTile,
+                             numThreads / subgroupSize))) {
+      LLVM_DEBUG(llvm::dbgs() << "[mlp] setting MMA configs failed\n");
+      return failure();
+    }
+    return success();
+  }
+
+  // 3. Otherwise distribute every op left in the workgroup forall to threads
+  // on its own.
   SmallVector<linalg::LinalgOp> ops;
   forallOp.walk([&](linalg::LinalgOp op) {
     if (!op->use_empty()) {

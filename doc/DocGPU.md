@@ -22,7 +22,7 @@ iree-compile llama-3.2-1b-instruct-f16.mlir -o llama.vmfb \
   `CUDATarget.cpp` is never called), so the vmfb carries PTX and the driver
   JIT-compiles it at load.
 
-## Files changed (1 new file, 6 modified)
+## Files changed (1 new file, 7 modified)
 
 | File | Change |
 |---|---|
@@ -32,6 +32,7 @@ iree-compile llama-3.2-1b-instruct-f16.mlir -o llama.vmfb \
 | `Codegen/LLVMGPU/Passes.cpp` | Adds the pass before workgroup tiling in TileAndFuse, under `#ifdef MY_PASS` / `isMLPFusionEnabled()` like the CPU side |
 | `Codegen/LLVMGPU/KernelConfig.cpp` | Sends the MLP chain to TileAndFuse. Without this, decode (M=1) goes to VectorDistribute and the pass never runs |
 | `Codegen/LLVMGPU/CMakeLists.txt` | `-DMY_PASS`, as in `LLVMCPU/CMakeLists.txt` |
+| `Codegen/Common/TileAndFuseUtils.cpp` | Reduction tiling only coalesces the new loop with an enclosing `scf.for` when the two form a perfect nest (needed by the [MMA path](#mma-path)) |
 
 ## Differences from the CPU rewrite
 
@@ -74,6 +75,10 @@ on it. With the rewrite it is ~1,000 lines, 88 registers, no spills.
 - decode (M=1) -> **TM = 1**
 
 ## Results
+
+The results in this section and in [Prefill length S](#prefill-length-s) are
+from the per-thread FMA (scalar) path, before the [MMA path](#mma-path) became
+the default for prefill. Memory numbers are the same on both paths.
 
 Host: ASUS GX10, NVIDIA GB10 (sm_121), CUDA 13.0, driver 580.159.03,
 `--device=cuda`. Compiled on x86 with the flags above; runtime built on the
@@ -147,6 +152,115 @@ gdb on the full module; times and RSS are all 3 runs.
 - Fused prefill wall time is 1.6x, 1.9x and 2.0x the baseline at S=512, 1024
   and 2048 (per-thread FMAs vs MMA; the ~1 s start-up is included).
 
+## MMA path
+
+### Why the scalar path is slow
+
+`nsys` per-kernel GPU time for one S=512 prefill (`cuda_gpu_kern_sum`):
+
+| | Baseline | Fused, scalar (TM=4) |
+|---|---:|---:|
+| MLP kernels, 16 layers | 92.0 ms (gate 39.4 + up 36.7 + down 15.9) | 905.7 ms (one kernel) |
+| Rest of the model | 155.3 ms | 153.0 ms |
+| Total GPU time | 247.3 ms | 1,058.7 ms |
+| MLP throughput (51.5 GFLOP per layer) | ~9.0 TFLOP/s | ~0.9 TFLOP/s |
+
+Row tile sweep (`--iree-codegen-gpu-mlp-row-tile`, all top-1 100% vs
+baseline): TM=1 1,048.7 ms, TM=2 1,005.0 ms, TM=4 905.7 ms, TM=8 1,138.0 ms.
+Cutting weight re-reads 8x leaves the time within ±15%, so weight reuse is not
+the bottleneck. The PTX has no `mma.sync`: every product is an
+`fma.rn.f32.f16` in chains of 16 dependent FMAs per output, and 88 registers x
+256 threads plus 37.9 KB of shared memory allow 2 workgroups (16 of 48 warps)
+per SM. At ~0.9 TFLOP/s the kernel reaches ~3% of the GB10's plain-FP32 peak
+(48 SMs at 2.42 GHz). TM=8 is slowest because 75.8 KB of shared memory leaves
+one workgroup per SM. Nsight Compute could not confirm the stall reasons: GPU
+performance counters are admin-only on the GX10 (`RmProfilingAdminOnly: 1`).
+
+### What it does
+
+Default for prefill (inner M dim a multiple of 16); decode (M=1) keeps the
+scalar path.
+
+```
+scf.forall (m, n) (16 rows, nTile = 512 cols)        // step 1: M and N, workgroups
+  acc = 0                       [16, 512] f32        // shared memory, 32 KB
+  scf.for f (kFfnChunk = 128)                        // step 2: F, gate/up/h fused in
+    gate, up = x[m] @ Wg/Wu[f]^T  [16, 128] f32      // MMA, K tiled to 32
+    h = silu(gate) * up           [16, 128] f16      // thread config
+    acc += h @ Wd[n, f]^T                            // MMA
+  out[m, n] = epilogue(acc)
+```
+
+- TM is one intrinsic (`NV_MMA_SYNC_F32_16x8x16_F16`, 16 rows). A [16, 2048]
+  f32 accumulator (128 KB) does not fit in shared memory, so N is split too
+  and gate/up are recomputed once per N tile (4x at nTile = 512, ~3x the
+  MLP's FLOPs in total).
+- Step 3 sets lowering configs instead of distributing to threads: gate and
+  up get `mma_kind`, `promote_operands = [0, 1]`, `reduction` (K) and
+  `subgroup` (N) tiles; down gets `mma_kind` and `subgroup`; h gets `thread`.
+  The TileAndFuse levels then lower them. `GPUApplyTilingLevel` does not fuse
+  a producer that has its own config at that level, so each op is tiled
+  alone and h is not recomputed per down subgroup tile. Thread tiling runs
+  before subgroup tiling, so h is already a thread forall when down is tiled.
+- Reduction tiling of gate/up happens inside the F loop.
+  `applyTileAndFuseToEachRoot` coalesced the new K loop with its parent
+  `scf.for` and asserted in `coalesceLoops`, since the F loop is not a perfect
+  nest; `TileAndFuseUtils.cpp` now only coalesces perfect nests.
+
+Flags (hidden):
+
+| Flag | Default | |
+|---|---:|---|
+| `--iree-codegen-gpu-mlp-mma` | true | MMA path; false gives the scalar path (vmfb byte-identical to before) |
+| `--iree-codegen-gpu-mlp-mma-n-tile` | 512 | N per workgroup; gate/up recomputed N / nTile times |
+| `--iree-codegen-gpu-mlp-mma-reduction-k` | 2 | gate/up K tile, in intrinsics (x16) |
+| `--iree-codegen-gpu-mlp-mma-promote` | true | gate/up operands (x, weight tile) to shared memory |
+| `--iree-codegen-gpu-mlp-row-tile` | 0 | scalar path only: force TM (0 = from the shared-memory budget) |
+
+Tuning at S=512 (fused MLP GPU time, 16 layers; every variant bit-identical
+to baseline):
+
+| nTile | K tile | Promote | MLP time | ms/layer |
+|---:|---:|:-:|---:|---:|
+| 1024 | 64 | no | 331.1 ms | 20.70 |
+| 1024 | 32 | no | 417.0 ms | 26.06 |
+| 1024 | 128 | no | 443.5 ms | 27.72 |
+| 512 | 64 | no | 360.7 ms | 22.55 |
+| 256 | 64 | no | 597.5 ms | 37.35 |
+| **512** | **32** | **yes** | **303.2 ms** | **18.95** |
+| 512 | 64 | yes | 441.2 ms | 27.57 |
+
+### Results
+
+Same host and setup as above; all three builds measured in one session, 3 runs
+each. MLP GPU time from `nsys`.
+
+| LLaMA-3.2-1B f16 prefill on GB10 | S=512 | S=1024 | S=2048 |
+|---|---:|---:|---:|
+| MLP GPU time, baseline (3 matmuls) | 92.0 ms | 191.7 ms | 368.7 ms |
+| MLP GPU time, fused scalar | 905.7 ms | 1,754.7 ms | 3,370.0 ms |
+| MLP GPU time, fused MMA | 303.5 ms | 619.0 ms | 1,163.8 ms |
+| Total GPU time, baseline | 247.3 ms | 630.6 ms | 1,916.1 ms |
+| Total GPU time, fused scalar | 1,058.7 ms | 2,197.0 ms | 4,917.1 ms |
+| Total GPU time, fused MMA | 457.1 ms | 1,062.3 ms | 2,721.1 ms |
+| Wall time, baseline | 1.34–1.36 s | 1.76–1.77 s | 3.15–3.18 s |
+| Wall time, fused scalar | 2.16–2.23 s | 3.33–3.38 s | 6.06–6.17 s |
+| Wall time, fused MMA | 1.61–1.66 s | 2.27–2.33 s | 3.97–4.01 s |
+| `DEVICE_LOCAL` peak, fused (both paths) | 2,900,114,056 B (−16 MiB) | 3,094,631,560 B (−32 MiB) | 3,587,475,592 B (−64 MiB) |
+| Logits, fused MMA vs baseline | bit-identical | bit-identical | bit-identical |
+
+- The fused MLP kernel is ~3.0x faster than the scalar one at every S and
+  ~3.2x slower than the baseline's three matmuls. Prefill wall time over
+  baseline drops from +0.84 / +1.58 / +2.96 s to +0.28 / +0.52 / +0.83 s.
+- Logits are bit-identical to the baseline: same intrinsic, and down
+  accumulates the same 128-wide K chunks.
+- Decode is unchanged (scalar path): 1.25–1.27 s vs 1.07–1.10 s baseline,
+  logits max |Δ| 0.0039.
+- The remaining gap is likely the 4x gate/up recompute (~3x the baseline's
+  MLP FLOPs) and low occupancy from the shared memory each workgroup holds
+  (32 KB accumulator, 20 KB of chunk buffers, plus the promoted x/weight
+  tiles); not confirmed without Nsight Compute counters.
+
 ## Reproducing
 
 1. Compiler: reconfigure the build with `-DIREE_TARGET_BACKEND_CUDA=ON` and
@@ -180,11 +294,15 @@ gdb on the full module; times and RSS are all 3 runs.
 
 ## Open items
 
-- Speed: put the per-chunk gate/up and `down` matmuls on MMA (tensor cores);
-  the shared-memory layout and memory saving would stay the same.
-- TM=8 needs more than half of sm_121's workgroup memory (75,776 B of
-  101,376 B); try a 3/4 budget once nothing else in the kernel needs shared
-  memory.
+- Speed, MMA path: keep the accumulator in registers (each subgroup owning an
+  N slice across the F loop) instead of shared memory. That removes the N
+  split, and with it the gate/up recompute and the shared-memory limit on
+  occupancy. It does not fit the stock TileAndFuse levels (the F loop holds
+  more than the accumulating op), so it needs its own loop structure.
+- Decode (M=1) still uses the scalar path and is ~0.17 s slower than
+  baseline for a 32 KiB saving; consider not fusing it.
+- Confirm the MMA-path bottleneck with Nsight Compute once performance
+  counters are enabled for non-admin users on the GX10.
 - Upstream the runtime name-lookup fix (or make the compiler emit
   `$`-free export names).
 - No lit test for `GPURewriteMLPChainAsForall` yet.
