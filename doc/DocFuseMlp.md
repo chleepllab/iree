@@ -57,13 +57,34 @@ once per (M, F) tile, not once per N tile.
 ```
 scf.forall m (TM rows)                               // step 1: M, workgroups
   acc = 0                       [TM, N] f32
-  scf.for f (kFfnChunk = 128)                        // step 2: F, gate/up/h fused in
-    gate, up = x[m] @ Wg/Wu[f]^T  [TM, 128] f32
-    h = silu(gate) * up           [TM, 128] f16
-    scf.for m' (8) / n (16) / k (16)                 // step 3: down tiled alone
-      acc[m', n] += h[m', k] @ Wd[n, k]^T
+  scf.for f (Fc = 128)                               // step 2: F, gate/up/h fused in
+    gate, up = x[m] @ Wg/Wu[f]^T  [TM, Fc] f32
+    h = silu(gate) * up           [TM, Fc] f16       // elementwise
+    scf.for n (vecN) / k (vecK)                      // step 3: down tiled alone
+      acc[0:TM, n] += h[0:TM, k] @ Wd[n, k]^T
   out[m] = epilogue(acc)
 ```
+
+Shapes (llama-3.2-1b, prefill S=512): x `[M, N]` = `[512, 2048]` f16;
+Wg, Wu `[F, N]` = `[8192, 2048]` f16 and Wd `[N, F]` = `[2048, 8192]` f16 as
+stored (`[out, in]`; "^T" is the reduction over the second dim, no copy is
+made); gate/up/h `[M, F]`; down/out `[M, N]`. Decode is M = 1.
+
+Tile sizes come from `down`'s `lowering_config` (KernelDispatch's choice for
+the target), falling back to the constants in the pass when a level is
+missing:
+
+| Size | Source | Fallback | x86 (AVX-512) | riscv64 (VLEN 256) |
+|---|---|---|---:|---:|
+| TM (max) | `distribution[0]` | `kVecM` = 8 | 8 | 8 |
+| Fc | `cache_reduction[2]`, rounded up to `lcm(vecK, gate's vecN)` | `kFfnChunk` = 128 | 128 | 128 |
+| vecM x vecN x vecK | `vector_common_parallel` / `vector_reduction` / `vector_inner_parallel` | 8 x 16 x 16 | 8 x 16 x 16 | 8 x 32 x 1 |
+
+There is no m' loop in practice: `down`'s M vector tile (vecM = 8) is at
+least TM (TM <= `distribution[0]` = 8, and 2 at the default stack limit, 1 for
+decode), so that loop has one iteration and is canonicalized away; all TM rows
+go through each vector op. It would only iterate if a config had
+`distribution[0]` larger than vecM.
 
 Differences from Hexagon:
 
@@ -71,19 +92,20 @@ Differences from Hexagon:
 |---|---|---|
 | M loop | `scf.for` | `scf.forall` mapped to workgroups |
 | M + K2 | one tile-and-fuse (`{tileM, tileK, 0}`) | two calls: M, then F with gate/up/h fused |
-| N loop | tile-and-fuse of fc2 over N | `down` tiled alone to 8x16x16 (vector size) |
+| N loop | tile-and-fuse of fc2 over N | `down` tiled alone to its vector tile (n, k loops) |
 | Producers | one matmul + GELU | two matmuls (gate, up) + SiLU*mul |
 
 Every op is tiled alone to vector size and its `lowering_config` dropped;
 otherwise the vector-level tile-and-fuse passes would anchor on `down` and
-fuse `h` into each N tile, recomputing the chunk N/16 times.
+fuse `h` into each N tile, recomputing the chunk N/vecN times.
 
 ## Row tile TM
 
-`pickRowTile` picks the largest power of two <= `kVecM` (8) whose stack buffers
-fit in 3/4 of the target's `max_stack_allocation_size`:
+`pickRowTile` picks the largest power of two <= `down`'s `distribution[0]`
+(8; `kVecM` if unset) whose stack buffers fit in 3/4 of the target's
+`max_stack_allocation_size`:
 
-- bytes per row = N*4 (f32 acc) + 128*(4+4+2) (gate, up f32; h f16) = 2048*4 + 1280 = 9,472 B
+- bytes per row = N*4 (f32 acc) + Fc*(4+4+2) (gate, up f32; h f16) = 2048*4 + 1280 = 9,472 B
 - 32 KiB default limit -> budget 24,576 B -> **TM = 2** (TM=4 needs 37,888 B)
 - 128 KiB limit -> budget 98,304 B -> **TM = 8** (75,776 B)
 
@@ -174,20 +196,25 @@ Cross-compiled on x86 with `--iree-llvmcpu-target-triple=riscv64
 `~/iree_c-build-riscv`. Same model, function, S and KV cache as above. One run
 each (a prefill takes 21–27 minutes).
 
-| LLaMA-3.2-1B f16, prefill S=512 | Baseline (128 KiB stack) | Custom fusion, TM=8 (128 KiB stack) |
-|---|---:|---:|
-| Transient buffer (activations) | 45,353,344 B | 28,576,128 B (−16 MiB) |
-| Max RSS | 2,858,624 KB | 2,842,496 KB (−15.7 MiB) |
-| `HOST_LOCAL` peak | 265,551,872 B | 265,551,872 B |
-| `DEVICE_LOCAL` peak | 134,222,088 B | 134,222,088 B |
-| Minor page faults | 814,438 | 806,552 |
-| Wall time | 1,643 s (27.4 min) | 1,277 s (21.3 min, −22%) |
-| Output | — | bit-identical |
+| LLaMA-3.2-1B f16, prefill S=512 | Baseline (128 KiB stack) | Custom fusion, TM=8, fixed 8x16x16 tile | Custom fusion, TM=8, config tile 8x32x1 |
+|---|---:|---:|---:|
+| Transient buffer (activations) | 45,353,344 B | 28,576,128 B (−16 MiB) | 28,576,128 B (−16 MiB) |
+| Max RSS | 2,858,624 KB | 2,842,496 KB (−15.7 MiB) | 2,842,240 KB (−16.0 MiB) |
+| `HOST_LOCAL` peak | 265,551,872 B | 265,551,872 B | 265,551,872 B |
+| `DEVICE_LOCAL` peak | 134,222,088 B | 134,222,088 B | 134,222,088 B |
+| Minor page faults | 814,438 | 806,552 | 813,195 |
+| Wall time | 1,643 s (27.4 min) | 1,277 s (21.3 min, −22%) | 1,902 s (31.7 min, +16%) |
+| Output | — | bit-identical | bit-identical |
+
+The fixed-tile column is the pass before tile sizes were read from
+`lowering_config`; the last column is the current pass.
 
 - Transient buffer: the same −16,777,216 B (−37.0%) as on x86 and aarch64.
   Max RSS is ~15.7 MiB lower.
-- Unlike x86 and aarch64, fused prefill is faster than the baseline here
-  (−366 s); not investigated.
+- With the fixed 8x16x16 tile, fused prefill is faster than the baseline
+  (−366 s); with the config tile (8x32x1, i.e. `down` reduced one k at a time)
+  it is slower (+259 s). One run each on a shared board (load average 3–5
+  during the last run), so the gap is not confirmed; see Open items.
 - TM=8 compiles without `--iree-llvmcpu-fail-on-large-vector=false` on this
   target.
 - gdb: `allocation_size` is in `$a6` (RISC-V LP64D; the semaphore lists and
@@ -225,3 +252,8 @@ transient arena.
 - TM=8 needs `--iree-llvmcpu-stack-allocation-limit=131072` today. The pass
   could choose TM against its own budget instead of the target default.
 - Decode (M=1) also goes through the rewrite; not measured.
+- riscv64: rerun the fixed-tile build under the same board load to tell
+  whether the config tile (vecK = 1) is really slower. If it is, keep TM and
+  Fc from the config but use a larger vecK for `down` on RISC-V.
+- The x86 tile is unchanged by the config-driven sizes (output bit-identical
+  to the fixed-tile build); the aarch64 tile was not re-checked.
