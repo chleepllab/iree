@@ -22,8 +22,9 @@ static llvm::cl::opt<bool> clCustomPacking(
     "iree-stream-custom-packing",
     llvm::cl::desc("Pack static transient slices with the custom packer "
                    "instead of the upstream greedy one. Implied by "
-                   "--iree-dispatch-creation-fuse-conv-chain and "
-                   "--iree-dispatch-creation-fuse-mlp."),
+                   "--iree-dispatch-creation-fuse-conv-chain, "
+                   "--iree-dispatch-creation-fuse-mlp and "
+                   "--iree-dispatch-creation-fuse-qkv."),
     llvm::cl::init(false));
 
 // The fused dispatch needs RewriteMLPChainAsForall in codegen (LLVMCPU only)
@@ -35,10 +36,22 @@ static llvm::cl::opt<bool> clFuseMLP(
                    "pack static slices with the custom packer."),
     llvm::cl::init(false));
 
+// The fused dispatch needs RewriteQKVChainAsForall in codegen (LLVMCPU only).
+static llvm::cl::opt<bool> clFuseQKV(
+    "iree-dispatch-creation-fuse-qkv",
+    llvm::cl::desc("Fuse an attention block's RMSNorm, Q/K/V projections and "
+                   "the RoPE on Q and K into a single dispatch (prefill "
+                   "only), and pack static slices with the custom packer."),
+    llvm::cl::init(false));
+
 bool isConvChainFusionEnabled() { return clFuseConvChain; }
 
-bool isCustomPackingEnabled() { return clCustomPacking || clFuseConvChain || clFuseMLP; }
+bool isCustomPackingEnabled() {
+  return clCustomPacking || clFuseConvChain || clFuseMLP || clFuseQKV;
+}
 
 bool isMLPFusionEnabled() { return clFuseMLP; }
+
+bool isQKVFusionEnabled() { return clFuseQKV; }
 
 } // namespace mlir::iree_compiler

@@ -230,13 +230,16 @@ static constexpr StringLiteral kConvChainRewrittenAttr =
     "iree_codegen.conv_chain_rewritten";
 static constexpr StringLiteral kMLPChainRewrittenAttr =
     "iree_codegen.mlp_chain_rewritten";
+static constexpr StringLiteral kQKVChainRewrittenAttr =
+    "iree_codegen.qkv_chain_rewritten";
 #endif // MY_PASS
 
 void TileAndDistributeToWorkgroupsUsingForallOpPass::runOnOperation() {
   mlir::FunctionOpInterface funcOp = getOperation();
 #ifdef MY_PASS
   if (funcOp->hasAttr(kConvChainRewrittenAttr) ||
-      funcOp->hasAttr(kMLPChainRewrittenAttr)) {
+      funcOp->hasAttr(kMLPChainRewrittenAttr) ||
+      funcOp->hasAttr(kQKVChainRewrittenAttr)) {
     return;
   }
 #endif // MY_PASS

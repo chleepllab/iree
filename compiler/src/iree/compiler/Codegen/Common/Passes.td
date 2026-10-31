@@ -1238,6 +1238,32 @@ def GPURewriteMLPChainAsForallPass :
   ];
 }
 
+def RewriteQKVChainAsForallPass :
+    InterfacePass<"iree-codegen-rewrite-qkv-chain-as-forall",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Rewrite a fused RMSNorm + QKV + RoPE dispatch into one "
+                "scf.forall over row tiles";
+
+  let description = [{
+    Matches the RMSNorm -> Q/K/V matmuls -> RoPE on Q and K dispatch formed
+    under --iree-dispatch-creation-fuse-qkv (RoPE on Q tagged
+    `iree_dispatch.special_qkv`) and rewrites it into an scf.forall over row
+    tiles that normalizes the rows once and then computes Q and K one head at
+    a time with the RoPE as the head's epilogue, and V in head-width chunks.
+    Rewritten functions are tagged `iree_codegen.qkv_chain_rewritten` so
+    later tiling skips them.
+  }];
+
+  let dependentDialects = [
+    "mlir::affine::AffineDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::iree_compiler::IREE::Codegen::IREECodegenDialect"
+  ];
+}
+
 def RewriteConvMaxpoolAsForallPass :
     InterfacePass<"iree-codegen-rewrite-conv-maxpool-as-forall",
                   "mlir::FunctionOpInterface"> {

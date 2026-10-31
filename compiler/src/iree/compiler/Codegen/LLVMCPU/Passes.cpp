@@ -83,7 +83,11 @@ addTileAndDistributePasses(OpPassManager &funcPassManager,
   if (isMLPFusionEnabled()) {
     funcPassManager.addPass(createRewriteMLPChainAsForallPass());
   }
-  if (isConvChainFusionEnabled() || isMLPFusionEnabled()) {
+  if (isQKVFusionEnabled()) {
+    funcPassManager.addPass(createRewriteQKVChainAsForallPass());
+  }
+  if (isConvChainFusionEnabled() || isMLPFusionEnabled() ||
+      isQKVFusionEnabled()) {
     funcPassManager.addPass(createCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
   }

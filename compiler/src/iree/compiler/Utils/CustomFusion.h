@@ -26,6 +26,10 @@ bool isCustomPackingEnabled();
 // both flags to get both.
 bool isMLPFusionEnabled();
 
+// --iree-dispatch-creation-fuse-qkv: RMSNorm + Q/K/V projections + RoPE fusion
+// (prefill), its codegen rewrite and the custom static slice packing.
+bool isQKVFusionEnabled();
+
 } // namespace mlir::iree_compiler
 
 #endif // IREE_COMPILER_UTILS_CUSTOMFUSION_H_

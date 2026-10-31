@@ -14,6 +14,7 @@ iree_cc_library(
   NAME
     DispatchCreation
   HDRS
+    "FuseQKVChain.h"
     "FusionUtils.h"
     "Passes.h"
   SRCS
@@ -34,6 +35,7 @@ iree_cc_library(
     "FuseEncodingOpsIntoDispatchRegions.cpp"
     "FuseHorizontalContractions.cpp"
     "FuseMultiUseElementwiseProducer.cpp"
+    "FuseQKVChain.cpp"
     "FusionPreprocessing.cpp"
     "FusionUtils.cpp"
     "HoistEncodingOps.cpp"
