@@ -15,6 +15,7 @@ iree_cc_library(
     DispatchCreation
   HDRS
     "CollapseDimensions.h"
+    "FuseQKVChain.h"
     "FusionUtils.h"
     "MaterializedLayoutTarget.h"
     "Passes.h"
@@ -37,6 +38,7 @@ iree_cc_library(
     "FuseEncodingOpsIntoDispatchRegions.cpp"
     "FuseHorizontalContractions.cpp"
     "FuseMultiUseElementwiseProducer.cpp"
+    "FuseQKVChain.cpp"
     "FusionPreprocessing.cpp"
     "FusionUtils.cpp"
     "HoistEncodingOps.cpp"

@@ -38,6 +38,7 @@ iree_compiler_cc_library(
         "FuseEncodingOpsIntoDispatchRegions.cpp",
         "FuseHorizontalContractions.cpp",
         "FuseMultiUseElementwiseProducer.cpp",
+        "FuseQKVChain.cpp",
         "FusionPreprocessing.cpp",
         "FusionUtils.cpp",
         "HoistEncodingOps.cpp",
@@ -57,6 +58,7 @@ iree_compiler_cc_library(
     ],
     hdrs = [
         "CollapseDimensions.h",
+        "FuseQKVChain.h",
         "FusionUtils.h",
         "MaterializedLayoutTarget.h",
         "Passes.h",

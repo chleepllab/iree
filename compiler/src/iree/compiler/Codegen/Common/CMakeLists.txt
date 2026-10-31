@@ -161,6 +161,7 @@ iree_cc_library(
     "RewriteConvChainAsForall.cpp"
     "RewriteConvMaxpoolAsForall.cpp"
     "RewriteMLPChainAsForall.cpp"
+    "RewriteQKVChainAsForall.cpp"
     "GPURewriteMLPChainAsForall.cpp"
     "SMTConstraintUtils.cpp"
     "SpecializeExports.cpp"

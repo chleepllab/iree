@@ -16,6 +16,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/LoopMappingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "iree/compiler/DispatchCreation/FuseQKVChain.h"
 #include "iree/compiler/DispatchCreation/FusionUtils.h"
 #include "iree/compiler/DispatchCreation/MaterializedLayoutTarget.h"
 #include "iree/compiler/DispatchCreation/Passes.h"
@@ -1400,6 +1401,27 @@ static bool tryFuseMLPChain(Operation *root, FusionGroup &fusionGroup,
   }
   return true;
 }
+
+/// Pulls the RMSNorm, the Q/K/V matmuls and truncs and the RoPE on K into the
+/// group of the RoPE on Q that prepareQKVChains tagged. Q, K and V all leave
+/// the dispatch; everything else is internal. Only worth it together with
+/// RewriteQKVChainAsForall, which tiles the whole chain by rows.
+static bool tryFuseQKVChain(Operation *root, FusionGroup &fusionGroup,
+                            FusionTracker &tracker) {
+  SmallVector<Operation *> chain;
+  if (failed(collectQKVChain(root, chain))) {
+    return false;
+  }
+  for (Operation *op : chain) {
+    if (op->getBlock() != root->getBlock() || tracker.isFusedOp(op)) {
+      return false;
+    }
+  }
+  for (Operation *op : chain) {
+    tracker.appendToFusionGroup(op, fusionGroup);
+  }
+  return true;
+}
 #endif // MY_FUSION
 
 /// Starting from the `root` op, traverse the operand use-def chain
@@ -1484,6 +1506,21 @@ decideFusableLinalgOps(Region &region, DominanceInfo const &dominanceInfo,
         continue;
       }
 
+#ifdef MY_FUSION
+      // The fused RMSNorm + QKV + RoPE chain is a group of its own: no other
+      // producer or consumer fusion, so it is kept out of `roots`.
+      if (isQKVFusionEnabled() && op.hasAttr(kSpecialQKVAttr)) {
+        if (!tracker.isFusedOp(&op)) {
+          FusionGroup &qkvGroup = tracker.createFusionGroup(context, &op);
+          if (!tryFuseQKVChain(&op, qkvGroup, tracker)) {
+            op.removeAttr(kSpecialQKVAttr);
+          }
+        } else {
+          op.removeAttr(kSpecialQKVAttr);
+        }
+        continue;
+      }
+#endif // MY_FUSION
       // Start with a root operation and fuse its producers.
       // Let a packed contraction claim its final unpack as a consumer.
       if (options.fuseMmt4d || options.fuseDataTiledConvolution) {
@@ -1800,6 +1837,11 @@ struct FormDispatchRegionsPass final
 /// Create dispatch.region Ops based on a fusion heuristic.
 void FormDispatchRegionsPass::runOnOperation() {
   mlir::FunctionOpInterface funcOp = getOperation();
+#ifdef MY_FUSION
+  if (isQKVFusionEnabled()) {
+    prepareQKVChains(funcOp);
+  }
+#endif // MY_FUSION
   DominanceInfo &dominanceInfo = getAnalysis<DominanceInfo>();
   TensorDimTrackingRewriter rewriter(funcOp);
   FormDispatchRegionsPassOptions options{aggressiveFusion,
