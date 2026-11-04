@@ -17,6 +17,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
@@ -668,6 +670,22 @@ LogicalResult MapLoadOp::generateScalarImplementation(OpBuilder &b,
     // The last yielded Value is the padding, the rest are source indices.
     Value paddingValue = yieldedValues.back();
     ArrayRef<Value> loadIndices = yieldedValues.drop_back();
+
+    // A poison padding means the map_load only relayouts an in-bounds source
+    // (no pad was folded in), so every index is in bounds by construction.
+    // In functions from GPURewriteMLPChainAsForall (opted in with the
+    // iree_codegen.mlp_map_load_unchecked attribute), load without the
+    // per-element bounds check, which keeps adjacent loads from being merged
+    // into vector loads.
+    auto funcOp = getOperation()->getParentOfType<FunctionOpInterface>();
+    if (paddingValue.getDefiningOp<ub::PoisonOp>() && funcOp &&
+        funcOp->hasAttr("iree_codegen.mlp_map_load_unchecked")) {
+      Value loaded = memref::LoadOp::create(nestedBuilder, nestedLoc,
+                                            getSource(), loadIndices);
+      memref::StoreOp::create(nestedBuilder, nestedLoc, loaded, getOutput(),
+                              ivs);
+      return;
+    }
 
     // Check bounds for each source dimension. Start with true so that
     // for 0-D sources, inBounds is always true.

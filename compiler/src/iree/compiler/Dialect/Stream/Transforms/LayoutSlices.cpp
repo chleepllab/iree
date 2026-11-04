@@ -16,6 +16,7 @@
 #include "iree/compiler/Utils/IntegerSet.h"
 #include "iree/compiler/Utils/CustomFusion.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Attributes.h"
@@ -406,6 +407,117 @@ packStaticSlices(Location loc, Value baseOffset,
   return builder.createOrFold<arith::AddIOp>(
           loc, baseOffset, indexSet.get(result.highwaterMark));
 }
+
+// A dynamic slice size written as `coeff * product(leaves)`, with the leaves
+// sorted. Built by looking through constants, muli, divui by a constant that
+// divides the coefficient exactly (so (32 * x) / 32 is x), and
+// util.assume.int; anything else is a leaf.
+struct SizeMonomial {
+  int64_t coeff = 1;
+  SmallVector<Value> leaves;
+};
+
+static SizeMonomial getSizeMonomial(Value v) {
+  APInt constant;
+  if (matchPattern(v, m_ConstantInt(&constant))) {
+    return {constant.getSExtValue(), {}};
+  }
+  Operation *def = v.getDefiningOp();
+  if (auto assume = dyn_cast_if_present<IREE::Util::AssumeIntOp>(def)) {
+    return getSizeMonomial(
+        assume.getOperands()[cast<OpResult>(v).getResultNumber()]);
+  }
+  if (auto mul = dyn_cast_if_present<arith::MulIOp>(def)) {
+    SizeMonomial lhs = getSizeMonomial(mul.getLhs());
+    SizeMonomial rhs = getSizeMonomial(mul.getRhs());
+    int64_t coeff = 0;
+    if (!llvm::MulOverflow(lhs.coeff, rhs.coeff, coeff)) {
+      lhs.coeff = coeff;
+      llvm::append_range(lhs.leaves, rhs.leaves);
+      llvm::sort(lhs.leaves, [](Value a, Value b) {
+        return a.getAsOpaquePointer() < b.getAsOpaquePointer();
+      });
+      return lhs;
+    }
+  }
+  if (auto div = dyn_cast_if_present<arith::DivUIOp>(def)) {
+    APInt divisor;
+    if (matchPattern(div.getRhs(), m_ConstantInt(&divisor)) &&
+        divisor.getSExtValue() > 0) {
+      SizeMonomial lhs = getSizeMonomial(div.getLhs());
+      if (lhs.coeff % divisor.getSExtValue() == 0) {
+        lhs.coeff /= divisor.getSExtValue();
+        return lhs;
+      }
+    }
+  }
+  return {1, {v}};
+}
+
+// Packs the dynamic slices whose sizes are constant multiples of the same
+// product of SSA values (e.g. S * 4096 and (S / 32) * 32768 are both multiples
+// of the page count S / 32): each such group is packed like static slices in
+// units of that product, with the coefficients as sizes, and each offset is
+// then `offset_in_units * unit`. Scaling every size and offset by the same
+// runtime unit keeps disjoint slices disjoint, and offsets / sizes stay
+// aligned because the unit offsets and sizes are. Unlike
+// packDynamicSlicesConservatively, slices of different sizes can share space.
+// The slices it cannot write that way are left in |slices| for the
+// conservative packer.
+static Value packDynamicSlicesByUnit(Location loc, Value baseOffset,
+                                     SmallVectorImpl<Slice> &slices,
+                                     IREE::Stream::ResourceConfigAttr
+                                         resourceConfig,
+                                     IndexSet &indexSet, OpBuilder &builder) {
+  int64_t offsetAlignment = resourceConfig.getMinBufferOffsetAlignment();
+  struct Group {
+    SmallVector<Value> leaves;
+    SmallVector<Slice> scaled;
+    SmallVector<Value> packedOffsets;
+  };
+  SmallVector<Group> groups;
+  SmallVector<Slice> rest;
+  for (Slice &slice : slices) {
+    SizeMonomial monomial = getSizeMonomial(slice.dynamicSize);
+    if (monomial.leaves.empty() || monomial.coeff <= 0) {
+      rest.push_back(slice);
+      continue;
+    }
+    auto it = llvm::find_if(
+        groups, [&](const Group &g) { return g.leaves == monomial.leaves; });
+    if (it == groups.end()) {
+      groups.push_back({monomial.leaves, {}, {}});
+      it = std::prev(groups.end());
+    }
+    Slice scaled = slice;
+    scaled.dynamicSize = indexSet.get(monomial.coeff);
+    it->scaled.push_back(scaled);
+    it->packedOffsets.push_back(slice.packedOffset);
+  }
+
+  Value offset = baseOffset;
+  for (Group &group : groups) {
+    PackingCandidate result =
+        chooseBestStaticSlicePacking(group.scaled, resourceConfig);
+    Value unit = group.leaves.front();
+    for (Value leaf : ArrayRef<Value>(group.leaves).drop_front()) {
+      unit = builder.createOrFold<arith::MulIOp>(loc, unit, leaf);
+    }
+    for (auto [i, packedOffset] : llvm::enumerate(group.packedOffsets)) {
+      Value scaledOffset = builder.createOrFold<arith::MulIOp>(
+          loc, indexSet.get(result.offsetsByOriginalIndex[i]), unit);
+      packedOffset.replaceAllUsesWith(
+          builder.createOrFold<arith::AddIOp>(loc, offset, scaledOffset));
+    }
+    Value groupSize = builder.createOrFold<arith::MulIOp>(
+        loc, indexSet.get(result.highwaterMark), unit);
+    offset = builder.createOrFold<IREE::Util::AlignOp>(
+        loc, builder.createOrFold<arith::AddIOp>(loc, offset, groupSize),
+        offsetAlignment);
+  }
+  slices = std::move(rest);
+  return offset;
+}
 #endif // MY_PACKING
 
 // Packs a set of statically-sized slices by greedy strip packing.
@@ -652,6 +764,13 @@ struct LayoutSlicesPass
       // Next pack all dynamic slices. Depending on the analysis information
       // available we could reuse static slices with non-overlapping lifetimes
       // in some cases.
+#ifdef MY_PACKING
+      if (!dynamicSlices.empty() && isCustomPackingEnabled()) {
+        offset = packDynamicSlicesByUnit(packOp.getLoc(), offset,
+                                         dynamicSlices, resourceConfig,
+                                         indexSet, builder);
+      }
+#endif // MY_PACKING
       if (!dynamicSlices.empty()) {
         offset = packDynamicSlicesConservatively(packOp.getLoc(), offset,
                                                  dynamicSlices, resourceConfig,

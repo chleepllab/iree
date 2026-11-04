@@ -163,6 +163,8 @@ iree_cc_library(
     "RewriteMLPChainAsForall.cpp"
     "RewriteQKVChainAsForall.cpp"
     "GPURewriteMLPChainAsForall.cpp"
+    "GPURewriteQKVChainAsForall.cpp"
+    "SkipCausalMaskedAttentionTiles.cpp"
     "SMTConstraintUtils.cpp"
     "SpecializeExports.cpp"
     "SplitFullPartialTransfer.cpp"
@@ -225,6 +227,7 @@ iree_cc_library(
     MLIRMemRefDialect
     MLIRMemRefTransforms
     MLIRMemRefUtils
+    MLIRNVGPUDialect
     MLIRParser
     MLIRPass
     MLIRROCDLDialect

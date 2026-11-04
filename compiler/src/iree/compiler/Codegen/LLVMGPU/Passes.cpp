@@ -445,6 +445,11 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
     funcPassManager.addPass(createCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
   }
+  if (isQKVFusionEnabled()) {
+    funcPassManager.addPass(createGPURewriteQKVChainAsForallPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+  }
 #endif
   tileAndDistributeToWorkgroup(funcPassManager);
 
@@ -825,6 +830,9 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
     funcPassManager.addPass(createCSEPass());
   }
 
+  // Drop the K2 iterations of a causally masked attention whose mask tile is
+  // all -inf (only attentions tagged in dispatch creation).
+  funcPassManager.addPass(createSkipCausalMaskedAttentionTilesPass());
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeAttentionPass());
   funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());

@@ -22,6 +22,8 @@
 
 #include "iree/compiler/DispatchCreation/FuseQKVChain.h"
 
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -29,6 +31,7 @@
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -586,6 +589,320 @@ LogicalResult collectQKVChain(Operation *root,
 // Preparation
 //===----------------------------------------------------------------------===//
 
+/// A one-in one-out all-parallel generic that only permutes: both maps are
+/// permutations and the body yields the input element.
+static bool isPureTranspose(linalg::GenericOp op) {
+  if (op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 1 ||
+      !isAllParallel(op) ||
+      !llvm::all_of(op.getIndexingMapsArray(),
+                    [](AffineMap m) { return m.isPermutation(); })) {
+    return false;
+  }
+  Block *body = op.getBlock();
+  auto yield = dyn_cast<linalg::YieldOp>(body->getTerminator());
+  return llvm::hasSingleElement(*body) && yield &&
+         yield.getNumOperands() == 1 &&
+         yield.getOperand(0) == body->getArgument(0);
+}
+
+/// The scatter whose updates are `op`'s result, if that is its only user.
+static IREE::LinalgExt::ScatterOp getOnlyScatterUser(linalg::GenericOp op) {
+  SmallVector<Operation *> users = getNonDimUsers(op->getResult(0));
+  if (users.size() != 1) {
+    return nullptr;
+  }
+  auto scatter = dyn_cast<IREE::LinalgExt::ScatterOp>(users[0]);
+  if (!scatter || scatter.getUpdates() != op->getResult(0)) {
+    return nullptr;
+  }
+  return scatter;
+}
+
+/// Tags the transposes that relayout `v` (through reshapes only) for a
+/// KV-cache scatter.
+static void tagCacheTransposes(Value v) {
+  SmallVector<Value> worklist = {v};
+  while (!worklist.empty()) {
+    Value cur = worklist.pop_back_val();
+    for (Operation *user : getNonDimUsers(cur)) {
+      if (isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(user)) {
+        worklist.push_back(user->getResult(0));
+        continue;
+      }
+      auto transpose = dyn_cast<linalg::GenericOp>(user);
+      if (transpose && isPureTranspose(transpose) &&
+          getOnlyScatterUser(transpose)) {
+        transpose->setAttr(kQKVCacheTransposeAttr,
+                           UnitAttr::get(transpose.getContext()));
+        LLVM_DEBUG(llvm::dbgs() << "[qkv] tagged cache transpose "
+                                << transpose << "\n");
+      }
+    }
+  }
+}
+
+Operation *getQKVCacheTranspose(Operation *op) {
+  auto scatter = dyn_cast<IREE::LinalgExt::ScatterOp>(op);
+  if (!scatter) {
+    return nullptr;
+  }
+  auto transpose = scatter.getUpdates().getDefiningOp<linalg::GenericOp>();
+  if (!transpose || !transpose->hasAttr(kQKVCacheTransposeAttr) ||
+      !isPureTranspose(transpose) || getOnlyScatterUser(transpose) != scatter) {
+    return nullptr;
+  }
+  return transpose;
+}
+
+//===----------------------------------------------------------------------===//
+// Causal attention masks
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// sum(coeffs[d] * d) + constant over a generic's loop dims.
+struct LinearIndex {
+  SmallVector<int64_t> coeffs;
+  int64_t constant = 0;
+};
+} // namespace
+
+/// `v` (computed in a generic's body from linalg.index values) as a linear
+/// form over the loop dims, looking through constants, addi / subi, muli by a
+/// constant and integer casts.
+static std::optional<LinearIndex> getLinearIndex(Value v, unsigned numLoops) {
+  LinearIndex result;
+  result.coeffs.assign(numLoops, 0);
+  APInt constant;
+  if (matchPattern(v, m_ConstantInt(&constant))) {
+    result.constant = constant.getSExtValue();
+    return result;
+  }
+  Operation *def = v.getDefiningOp();
+  if (!def) {
+    return std::nullopt;
+  }
+  if (auto index = dyn_cast<linalg::IndexOp>(def)) {
+    if (index.getDim() >= numLoops) {
+      return std::nullopt;
+    }
+    result.coeffs[index.getDim()] = 1;
+    return result;
+  }
+  if (isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
+          arith::ExtUIOp>(def)) {
+    return getLinearIndex(def->getOperand(0), numLoops);
+  }
+  if (!isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(def)) {
+    return std::nullopt;
+  }
+  std::optional<LinearIndex> lhs = getLinearIndex(def->getOperand(0), numLoops);
+  std::optional<LinearIndex> rhs = getLinearIndex(def->getOperand(1), numLoops);
+  if (!lhs || !rhs) {
+    return std::nullopt;
+  }
+  auto isConstant = [](const LinearIndex &l) {
+    return llvm::all_of(l.coeffs, [](int64_t c) { return c == 0; });
+  };
+  if (isa<arith::MulIOp>(def)) {
+    if (!isConstant(*rhs)) {
+      std::swap(lhs, rhs);
+    }
+    if (!isConstant(*rhs)) {
+      return std::nullopt;
+    }
+    for (int64_t &c : lhs->coeffs) {
+      c *= rhs->constant;
+    }
+    lhs->constant *= rhs->constant;
+    return lhs;
+  }
+  int64_t sign = isa<arith::SubIOp>(def) ? -1 : 1;
+  for (auto [l, r] : llvm::zip_equal(lhs->coeffs, rhs->coeffs)) {
+    l += sign * r;
+  }
+  lhs->constant += sign * rhs->constant;
+  return lhs;
+}
+
+/// A condition `cond` implies, as `D(x) > 0` with D = sum(c_i * x_i) + c_0 a
+/// linear form over the loop dims: found as a cmpi in the ori tree of `cond`
+/// whose sides are linear forms. The first such cmpi with both positive and
+/// negative coefficients (a key position compared with a query position).
+static std::optional<LinearIndex> getImpliedPositive(Value cond,
+                                                     unsigned numLoops) {
+  Operation *def = cond.getDefiningOp();
+  if (auto ori = dyn_cast_if_present<arith::OrIOp>(def)) {
+    if (auto l = getImpliedPositive(ori.getLhs(), numLoops)) {
+      return l;
+    }
+    return getImpliedPositive(ori.getRhs(), numLoops);
+  }
+  auto cmp = dyn_cast_if_present<arith::CmpIOp>(def);
+  if (!cmp) {
+    return std::nullopt;
+  }
+  std::optional<LinearIndex> lhs = getLinearIndex(cmp.getLhs(), numLoops);
+  std::optional<LinearIndex> rhs = getLinearIndex(cmp.getRhs(), numLoops);
+  if (!lhs || !rhs) {
+    return std::nullopt;
+  }
+  // a > b  <=>  a - b > 0;  a >= b  <=>  a - b + 1 > 0 (and mirrored for <).
+  bool swap = false;
+  int64_t plus = 0;
+  switch (cmp.getPredicate()) {
+  case arith::CmpIPredicate::sgt:
+    break;
+  case arith::CmpIPredicate::sge:
+    plus = 1;
+    break;
+  case arith::CmpIPredicate::slt:
+    swap = true;
+    break;
+  case arith::CmpIPredicate::sle:
+    swap = true;
+    plus = 1;
+    break;
+  default:
+    return std::nullopt;
+  }
+  if (swap) {
+    std::swap(lhs, rhs);
+  }
+  for (auto [l, r] : llvm::zip_equal(lhs->coeffs, rhs->coeffs)) {
+    l -= r;
+  }
+  lhs->constant = lhs->constant - rhs->constant + plus;
+  bool hasPos = llvm::any_of(lhs->coeffs, [](int64_t c) { return c > 0; });
+  bool hasNeg = llvm::any_of(lhs->coeffs, [](int64_t c) { return c < 0; });
+  if (!hasPos || !hasNeg) {
+    return std::nullopt;
+  }
+  return lhs;
+}
+
+/// Row-major strides of `dims` (in increasing order) within their group, from
+/// the static sizes `getSize` gives; the outermost may be dynamic. Fails if an
+/// inner one is not static.
+static std::optional<SmallVector<int64_t>>
+getGroupStrides(ArrayRef<int64_t> dims,
+                llvm::function_ref<int64_t(int64_t)> getSize) {
+  SmallVector<int64_t> sorted(dims);
+  llvm::sort(sorted);
+  SmallVector<int64_t> strides(sorted.size(), 1);
+  for (int64_t i = static_cast<int64_t>(sorted.size()) - 2; i >= 0; --i) {
+    int64_t inner = getSize(sorted[i + 1]);
+    if (ShapedType::isDynamic(inner)) {
+      return std::nullopt;
+    }
+    strides[i] = strides[i + 1] * inner;
+  }
+  return strides;
+}
+
+/// The size of iteration dim `dim` of `attn`, read from the first operand
+/// whose map has it as a plain result.
+static int64_t getAttentionDimSize(IREE::LinalgExt::AttentionOp attn,
+                                   int64_t dim) {
+  for (auto [map, operand] :
+       llvm::zip(attn.getIndexingMapsArray(), attn->getOperands())) {
+    auto type = dyn_cast<ShapedType>(operand.getType());
+    if (!type) {
+      continue;
+    }
+    for (auto [i, expr] : llvm::enumerate(map.getResults())) {
+      auto d = dyn_cast<AffineDimExpr>(expr);
+      if (d && d.getPosition() == dim) {
+        return type.getDimSize(i);
+      }
+    }
+  }
+  return ShapedType::kDynamic;
+}
+
+/// Tags every attention whose mask is a generic writing -inf wherever the key
+/// position exceeds the query position (see kCausalMaskAttr).
+void tagCausalAttentionMasks(FunctionOpInterface funcOp) {
+  funcOp.walk([&](IREE::LinalgExt::AttentionOp attn) {
+    Value mask = attn.getMask();
+    std::optional<AffineMap> maskMap = attn.getMaskMap();
+    auto maskOp = mask ? mask.getDefiningOp<linalg::GenericOp>() : nullptr;
+    if (!maskOp || !maskMap || maskOp->getNumResults() != 1 ||
+        !isAllParallel(maskOp) ||
+        !maskOp.getIndexingMapsArray().back().isIdentity() ||
+        maskMap->getNumResults() != maskOp.getNumLoops()) {
+      return;
+    }
+    auto yield = cast<linalg::YieldOp>(maskOp.getBlock()->getTerminator());
+    auto select = yield.getOperand(0).getDefiningOp<arith::SelectOp>();
+    APFloat negInf(0.0);
+    if (!select ||
+        !matchPattern(select.getTrueValue(), m_ConstantFloat(&negInf)) ||
+        !negInf.isInfinity() || !negInf.isNegative()) {
+      return;
+    }
+    std::optional<LinearIndex> d =
+        getImpliedPositive(select.getCondition(), maskOp.getNumLoops());
+    if (!d) {
+      return;
+    }
+    // D over the attention's iteration dims, through the mask's map.
+    int64_t rank = maskMap->getNumDims();
+    SmallVector<int64_t> coeffs(rank, 0);
+    for (auto [i, expr] : llvm::enumerate(maskMap->getResults())) {
+      auto dim = dyn_cast<AffineDimExpr>(expr);
+      if (!dim) {
+        return;
+      }
+      coeffs[dim.getPosition()] += d->coeffs[i];
+    }
+    FailureOr<IREE::LinalgExt::AttentionOpDetail> detail =
+        IREE::LinalgExt::AttentionOpDetail::get(
+            attn.getQueryMap(), attn.getKeyMap(), attn.getValueMap(),
+            attn.getOutputMap());
+    if (failed(detail)) {
+      return;
+    }
+    // D must be exactly lin(K2) - lin(M) + delta, over the M / K2 dims the
+    // mask reads (M also holds the query heads, which the mask ignores).
+    auto inMask = [&](ArrayRef<int64_t> dims) {
+      SmallVector<int64_t> used;
+      for (int64_t dim : dims) {
+        if (maskMap->getResultPosition(getAffineDimExpr(dim, attn.getContext()))) {
+          used.push_back(dim);
+        }
+      }
+      return used;
+    };
+    SmallVector<int64_t> k2Dims = inMask(detail->getK2Dims());
+    SmallVector<int64_t> mDims = inMask(detail->getMDims());
+    auto getSize = [&](int64_t dim) { return getAttentionDimSize(attn, dim); };
+    SmallVector<int64_t> expected(rank, 0);
+    for (auto [dims, sign] :
+         {std::pair(ArrayRef<int64_t>(k2Dims), int64_t{1}),
+          std::pair(ArrayRef<int64_t>(mDims), int64_t{-1})}) {
+      std::optional<SmallVector<int64_t>> strides =
+          getGroupStrides(dims, getSize);
+      if (!strides) {
+        return;
+      }
+      SmallVector<int64_t> sorted(dims);
+      llvm::sort(sorted);
+      for (auto [dim, stride] : llvm::zip_equal(sorted, *strides)) {
+        expected[dim] = sign * stride;
+      }
+    }
+    if (coeffs != expected) {
+      return;
+    }
+    Builder b(attn.getContext());
+    attn->setAttr(kCausalMaskAttr,
+                  b.getDictionaryAttr({b.getNamedAttr(
+                      "delta", b.getI64IntegerAttr(d->constant))}));
+    LLVM_DEBUG(llvm::dbgs() << "[qkv] tagged causal attention " << attn
+                            << "\n");
+  });
+}
+
 void prepareQKVChains(FunctionOpInterface funcOp) {
   IRRewriter rewriter(funcOp.getContext());
 
@@ -683,8 +1000,13 @@ void prepareQKVChains(FunctionOpInterface funcOp) {
   // 3. Tag the RoPEs on Q whose chain now matches (the dead reshapes / slices
   // above would otherwise count as extra users of the projections).
   for (linalg::GenericOp ropeQ : candidates) {
-    if (succeeded(matchQKVChain(ropeQ))) {
+    if (FailureOr<QKVChain> chain = matchQKVChain(ropeQ); succeeded(chain)) {
       ropeQ->setAttr(kSpecialQKVAttr, rewriter.getUnitAttr());
+      // K and V leave the dispatch in [S, ...] order; the KV cache wants them
+      // per page as [heads, 32, head_dim]. Let the scatters do that
+      // transpose instead of a dispatch of its own and a transposed copy.
+      tagCacheTransposes(chain->ropeK->getResult(0));
+      tagCacheTransposes(chain->truncV->getResult(0));
       LLVM_DEBUG(llvm::dbgs() << "[qkv] tagged " << ropeQ << "\n");
     } else {
       LLVM_DEBUG(llvm::dbgs() << "[qkv] chain does not match after prep\n");

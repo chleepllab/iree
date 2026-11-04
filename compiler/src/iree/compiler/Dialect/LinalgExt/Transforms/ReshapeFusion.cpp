@@ -1172,6 +1172,12 @@ static Operation *createCollapsedOp(AttentionOpTy origOp,
   collapsedOp->setDiscardableAttrs(origOp->getDiscardableAttrDictionary());
   rewriter.inlineRegionBefore(origOp.getRegion(), collapsedOp.getRegion(),
                               collapsedOp.getRegion().begin());
+  // The causal-mask tag (set under --iree-dispatch-creation-fuse-qkv) is
+  // stated over the row-major positions of the M and K2 dim groups, which a
+  // collapse keeps, so it carries over.
+  if (Attribute causal = origOp->getAttr("iree_linalg_ext.causal_mask")) {
+    collapsedOp->setAttr("iree_linalg_ext.causal_mask", causal);
+  }
   return collapsedOp;
 }
 

@@ -167,6 +167,11 @@ struct GPUReduceBankConflictsPass final
 
   void runOnOperation() override {
     FunctionOpInterface funcOp = getOperation();
+    // GPURewriteMLPChainAsForall's direct kernels pad their shared buffers
+    // themselves (and ldmatrix needs their 16-byte row alignment).
+    if (funcOp->hasAttr("iree_codegen.mlp_direct")) {
+      return;
+    }
 
     IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp);
     unsigned sharedMemLimit =

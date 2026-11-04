@@ -36,12 +36,16 @@ static llvm::cl::opt<bool> clFuseMLP(
                    "pack static slices with the custom packer."),
     llvm::cl::init(false));
 
-// The fused dispatch needs RewriteQKVChainAsForall in codegen (LLVMCPU only).
+// The fused dispatch needs RewriteQKVChainAsForall in codegen (LLVMCPU) or
+// GPURewriteQKVChainAsForall (LLVMGPU TileAndFuse).
 static llvm::cl::opt<bool> clFuseQKV(
     "iree-dispatch-creation-fuse-qkv",
     llvm::cl::desc("Fuse an attention block's RMSNorm, Q/K/V projections and "
                    "the RoPE on Q and K into a single dispatch (prefill "
-                   "only), and pack static slices with the custom packer."),
+                   "only), fuse the K / V cache transposes into the cache "
+                   "scatters, fold the attention mask broadcast into the "
+                   "mask's indexing map, and pack slices with the custom "
+                   "packer."),
     llvm::cl::init(false));
 
 bool isConvChainFusionEnabled() { return clFuseConvChain; }
@@ -53,5 +57,21 @@ bool isCustomPackingEnabled() {
 bool isMLPFusionEnabled() { return clFuseMLP; }
 
 bool isQKVFusionEnabled() { return clFuseQKV; }
+
+static llvm::cl::opt<bool> clFuseAttention(
+    "iree-dispatch-creation-fuse-attention",
+    llvm::cl::desc("Attention on IREE's own kernels: block K / V / the mask's "
+                   "K2 dim for a dynamic sequence length (TensorDynamicDim"
+                   "Analysis reads load_from_buffer dims, so the GPU MMA "
+                   "attention config applies), skip the fully masked K2 tiles "
+                   "of a causal attention, and fold the attention mask "
+                   "broadcast into the mask's indexing map."),
+    llvm::cl::init(false));
+
+bool isAttentionFusionEnabled() { return clFuseAttention; }
+
+bool isAttentionMaskBroadcastFoldEnabled() {
+  return clFuseQKV || clFuseAttention;
+}
 
 } // namespace mlir::iree_compiler
