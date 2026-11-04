@@ -188,6 +188,16 @@ void populateForOpInductionVarShapePatterns(RewritePatternSet &,
 /// send such dispatches to the TileAndFuse pipeline.
 bool isGatedMLPChainDown(Operation *op);
 
+/// Runs after subgroup tiling in TileAndFuse: tiles the warp-level down
+/// projection of a GPURewriteMLPChainAsForall function into a serial k2 loop
+/// inside each warp.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createGPUTileMLPDownPerWarpPass();
+
+/// Fuses the gate and up k loops of a GPURewriteMLPChainAsForall function.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createGPUFuseMLPGateUpLoopsPass();
+
 //----------------------------------------------------------------------------//
 // Register CodeGen Common Passes
 //----------------------------------------------------------------------------//

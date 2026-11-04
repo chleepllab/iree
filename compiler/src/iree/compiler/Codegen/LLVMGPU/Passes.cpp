@@ -536,6 +536,11 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
     options.fuseConsumers = false;
     funcPassManager.addPass(createGPUApplyTilingLevelPass(options));
   }
+#ifdef MY_PASS
+  if (isMLPFusionEnabled()) {
+    funcPassManager.addPass(createGPUTileMLPDownPerWarpPass());
+  }
+#endif
   funcPassManager.addPass(IREE::GPU::createDistributeInnerTiledToLanesPass());
 
   // Step 4.5. Things that need to happen right after distribution to threads.
@@ -565,6 +570,12 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
 
   // Step 5. Greedily fuse parallel loops and hoist from serial loops.
   funcPassManager.addPass(createGPUFuseAndHoistParallelLoopsPass());
+#ifdef MY_PASS
+  if (isMLPFusionEnabled()) {
+    funcPassManager.addPass(createGPUFuseMLPGateUpLoopsPass());
+    funcPassManager.addPass(createCSEPass());
+  }
+#endif
   funcPassManager.addPass(createCombineSourceLayoutTransformationPass());
   CombineResultLayoutTransformationPassOptions combineLayoutOptions;
   combineLayoutOptions.scope =

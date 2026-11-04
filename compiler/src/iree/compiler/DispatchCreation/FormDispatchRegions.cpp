@@ -1356,6 +1356,15 @@ getMLPMatmulThroughTrunc(Value v, SmallVectorImpl<Operation *> &chain) {
 /// and `h`) round-trip through memory. Fusing them only pays off together with
 /// RewriteMLPChainAsForall, which produces `h` one ffn-chunk at a time; the
 /// stock tile-and-distribute would keep every op at full size.
+// Chains whose (static) row count is below this are not fused: for decode
+// (M = 1) the fusion only saves the [1, F] intermediates, and on GPU the
+// fused M = 1 kernel is slower than the separate matmuls. 0 fuses all.
+static llvm::cl::opt<int64_t> clFuseMLPMinRows(
+    "iree-dispatch-creation-fuse-mlp-min-rows",
+    llvm::cl::desc("With --iree-dispatch-creation-fuse-mlp, leave gated MLP "
+                   "chains with a static row count below this unfused."),
+    llvm::cl::init(0));
+
 static bool tryFuseMLPChain(Operation *root, FusionGroup &fusionGroup,
                             FusionTracker &tracker) {
   SmallVector<Operation *> downChain;
@@ -1363,6 +1372,21 @@ static bool tryFuseMLPChain(Operation *root, FusionGroup &fusionGroup,
   if (!down || getMLPMatmulThroughTrunc(root->getResult(0), downChain) !=
                    down) {
     return false;
+  }
+  if (clFuseMLPMinRows > 0) {
+    // Rows: product of all result dims but the last (static only).
+    auto outType = cast<ShapedType>(down->getResult(0).getType());
+    int64_t rows = 1;
+    for (int64_t d : outType.getShape().drop_back()) {
+      if (ShapedType::isDynamic(d)) {
+        rows = ShapedType::kDynamic;
+        break;
+      }
+      rows *= d;
+    }
+    if (!ShapedType::isDynamic(rows) && rows < clFuseMLPMinRows) {
+      return false;
+    }
   }
   auto act = down.getDpsInputs()[0].getDefiningOp<linalg::GenericOp>();
   if (!act || act.getNumDpsInputs() != 2 || act.getNumDpsInits() != 1 ||
