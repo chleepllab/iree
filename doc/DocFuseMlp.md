@@ -160,6 +160,38 @@ Transient buffer size is captured at runtime with a gdb breakpoint on
   same 16 MiB transient saving. Max RSS is ~0.5–0.75 MiB above TM=2 from the
   larger per-thread stack buffers.
 
+### Prefill length S and decode (x86)
+
+Baseline vs custom fusion, both with the 128 KiB stack (TM=8). Prefill:
+`prefill_bs1` with S tokens; decode: `decode_bs1`, one token at position S
+(seq_len S+1; KV cache zero-filled, since `iree-run-module` cannot chain
+calls; sizes and work are the same). One gdb run per cell for the transient
+size, 3 timed runs. The S=512 prefill column repeats the TM=8 numbers above.
+Cells read baseline → fused; "(both)" means equal.
+
+| LLaMA-3.2-1B f16 on x86 | S=512 | S=1024 | S=2048 |
+|---|---:|---:|---:|
+| Prefill transient buffer | 45,353,344 B → 28,576,128 B (−16 MiB) | 125,309,696 B → 91,755,264 B (−32 MiB) | 389,031,424 B → 321,922,560 B (−64 MiB) |
+| Decode transient buffer | 138,761,600 B → 138,728,832 B (−32 KiB) | 142,989,696 B → 142,956,928 B (−32 KiB) | 151,445,888 B → 151,413,120 B (−32 KiB) |
+| Prefill `DEVICE_LOCAL` peak | 134,222,088 B (both) | 134,226,312 B (both) | 134,234,760 B (both) |
+| Decode `DEVICE_LOCAL` peak | 134,218,016 B (both) | 134,218,144 B (both) | 134,218,400 B (both) |
+| Prefill `HOST_LOCAL` peak | 265,551,872 B (both) | 396,886,016 B (both) | 659,554,304 B (both) |
+| Decode `HOST_LOCAL` peak | 256,512 B (both) | 256,512 B (both) | 256,512 B (both) |
+| Prefill wall time (3 runs) | 2.17–2.49 s → 2.14–2.31 s | 3.66–3.67 s → 4.20–4.24 s | 8.63–9.64 s → 9.56–9.64 s |
+| Decode wall time (3 runs) | 0.74–0.75 s → 0.84–0.86 s | 0.75–0.76 s → 0.85 s | 0.76–0.78 s → 0.86 s |
+
+- Transient sizes are byte-identical to the GB10 (CUDA) runs. The prefill
+  saving is 2 × S × 8192 × 2 B (`gate` and `up` in f16), linear in S; the
+  decode saving is the two `[1, 8192]` f16 intermediates (32,768 B).
+- `HOST_LOCAL` / `DEVICE_LOCAL` do not include the transient arena on CPU, so
+  they do not change. Prefill `HOST_LOCAL` is exactly S × 128256 × 2 B (f16
+  logits) + 134,217,728 B (128 MiB, the KV cache's size) at all three S; what
+  the 128 MiB part is was not traced. Decode `HOST_LOCAL` is 1 × 128256 × 2 B.
+- Fused prefill matches the baseline at S=512 but is ~15% slower at S=1024;
+  at S=2048 one baseline run was 9.64 s against 8.63–8.64 s for the other
+  two, so the gap there (~0–10%) is not settled. Fused decode is ~0.1 s
+  slower at every S.
+
 ### GX10 (aarch64)
 
 Host: ASUS GX10, Cortex-X925 + Cortex-A725 (20 cores), `--device=local-task`.
