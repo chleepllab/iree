@@ -27,8 +27,27 @@ bool isCustomPackingEnabled();
 bool isMLPFusionEnabled();
 
 // --iree-dispatch-creation-fuse-qkv: RMSNorm + Q/K/V projections + RoPE fusion
-// (prefill), its codegen rewrite and the custom static slice packing.
+// (prefill), its codegen rewrite, the K / V cache transposes fused into the
+// cache scatters, the custom slice packing, and the attention mask broadcast
+// fold (also under fuse-attention): a broadcast producing an attention mask folds into the mask's
+// indexing map even when it broadcasts away whole dim groups (upstream refuses
+// that for every operand; the dim groups are inferred from Q/K/V/O only, so
+// the mask is safe), so the [heads, S, S] mask is never materialized.
 bool isQKVFusionEnabled();
+
+// --iree-dispatch-creation-fuse-attention: attention on IREE's own kernels.
+//  - TensorDynamicDimAnalysis reads the dynamic dims of
+//    `iree_codegen.load_from_buffer` results from the buffer (upstream only
+//    handles dispatch.tensor.load and tensor.empty), so their divisibility
+//    reaches BlockDynamicDimensions, which blocks K / V / the mask's K2 dim to
+//    [?, 32] and lets the GPU MMA attention config apply.
+//  - Causal attentions are tagged in dispatch creation and their fully masked
+//    K2 tiles skipped in codegen (SkipCausalMaskedAttentionTiles).
+//  - The attention mask broadcast fold (also on under fuse-qkv).
+bool isAttentionFusionEnabled();
+
+// The attention mask broadcast fold: under fuse-qkv or fuse-attention.
+bool isAttentionMaskBroadcastFoldEnabled();
 
 } // namespace mlir::iree_compiler
 

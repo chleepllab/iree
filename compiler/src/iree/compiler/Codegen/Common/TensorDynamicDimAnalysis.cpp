@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/TensorDynamicDimAnalysis.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
+#include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
+#include "iree/compiler/Utils/CustomFusion.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "iree/compiler/Dialect/Util/Analysis/IntegerDivisibilityAnalysis.h"
 #include "llvm/Support/Debug.h"
@@ -123,6 +126,36 @@ static void updateTensorDimInfo(
   }
 }
 
+// Update the tensor dimension information for result of an
+// `iree_codegen.load_from_buffer` operation: its dynamic dims are the buffer's
+// (e.g. the `{%d}` of a `hal.interface.binding.subspan`). Without this, the
+// operands of ops fed straight from buffers (attention's Q / K / V on GPU)
+// get no divisibility and are never blocked.
+static void updateTensorDimInfo(
+    IREE::Codegen::LoadFromBufferOp loadOp, const DataFlowSolver &solver,
+    TensorDynamicDimAnalysis::TensorDimDivisibilityInfo &divisibilityInfo,
+    TensorDynamicDimAnalysis::TensorDimRangeInfo &rangeInfo) {
+  auto resultType = cast<RankedTensorType>(loadOp.getTensor().getType());
+  if (!isAttentionFusionEnabled() || resultType.hasStaticShape()) {
+    return;
+  }
+  std::optional<ValueRange> dynamicDims =
+      IREE::Util::findDynamicDims(loadOp.getBuffer());
+  if (!dynamicDims ||
+      dynamicDims->size() != (size_t)resultType.getNumDynamicDims()) {
+    return;
+  }
+  int dimOperandIndex = 0;
+  for (auto [index, shape] : llvm::enumerate(resultType.getShape())) {
+    if (ShapedType::isStatic(shape)) {
+      continue;
+    }
+    updateTensorDimInfo(loadOp.getTensor(), index,
+                        (*dynamicDims)[dimOperandIndex++], solver,
+                        divisibilityInfo, rangeInfo);
+  }
+}
+
 // Update the tensor dimension information for result of a `tensor.empty`
 // operation.
 static void updateTensorDimInfo(
@@ -175,7 +208,8 @@ static void updateTensorDimInfo(
   });
 
   TypeSwitch<Operation *, void>(op)
-      .Case<IREE::TensorExt::DispatchTensorLoadOp, tensor::EmptyOp>(
+      .Case<IREE::TensorExt::DispatchTensorLoadOp, tensor::EmptyOp,
+            IREE::Codegen::LoadFromBufferOp>(
           [&](auto op) {
             updateTensorDimInfo(op, solver, divisibilityInfo, rangeInfo);
           })

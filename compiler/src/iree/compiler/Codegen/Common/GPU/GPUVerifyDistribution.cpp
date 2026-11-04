@@ -33,6 +33,11 @@ struct GPUVerifyDistributionPass final
 
   void runOnOperation() override {
     FunctionOpInterface funcOp = getOperation();
+    // Kernels emitted already distributed (GPURewriteMLPChainAsForall's
+    // direct path indexes by gpu.thread_id itself).
+    if (funcOp->hasAttr("iree_codegen.mlp_direct")) {
+      return;
+    }
 
     std::optional<SmallVector<int64_t>> workgroupSize =
         getWorkgroupSize(funcOp);

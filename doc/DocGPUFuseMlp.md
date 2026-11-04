@@ -207,12 +207,21 @@ scf.forall (m, n) (16 rows, nTile = 512 cols)        // step 1: M and N, workgro
   `scf.for` and asserted in `coalesceLoops`, since the F loop is not a perfect
   nest; `TileAndFuseUtils.cpp` now only coalesces perfect nests.
 
-Flags (hidden):
+Flags:
 
 | Flag | Default | |
 |---|---:|---|
-| `--iree-codegen-gpu-mlp-mma` | true | MMA path (TM = 16, N split into 1024-column tiles); false gives the scalar TM = 8 path |
-| `--iree-codegen-gpu-mlp-down-k-tile` | 16 | scalar path: down's serial K step per thread; 0 = whole 128 chunk in one op |
+| `--iree-dispatch-creation-fuse-mlp` | false | turns the MLP fusion on |
+
+The GPU path is picked by shape, with no flag: the direct path (see
+[IREE-generated kernel matching the hand kernel](#iree-generated-kernel-matching-the-hand-kernel))
+when it applies, else the TileAndFuse MMA path (inner M dim a multiple of 16),
+else the scalar path. Decode (M = 1, fewer than 2 static rows) is never fused.
+The `--iree-codegen-gpu-mlp-mma`, `--iree-codegen-gpu-mlp-down-k-tile`,
+`--iree-codegen-gpu-mlp-direct` and `--iree-dispatch-creation-fuse-mlp-min-rows`
+flags used below were removed; the scalar path's down k2 step is the constant
+`kDownKTile` (16), and the TM = 8 scalar path is no longer selectable for
+prefill.
 
 The MMA path's N tile, gate/up K tile and operand promotion are now fixed
 constants, set to 1024, 4 intrinsics (K = 64) and off (Option 1: promotion
@@ -405,7 +414,8 @@ listed by the schedule they implement; `acc` is always f32 in shared memory.
 
 ### TM = 8, no N split (scalar)
 
-`--iree-codegen-gpu-mlp-mma=false`. One workgroup per 8 rows and all 2048
+Selected with the since-removed `--iree-codegen-gpu-mlp-mma=false`. One
+workgroup per 8 rows and all 2048
 columns, so gate/up are computed once per (M, K2):
 
 ```
@@ -419,7 +429,8 @@ scf.forall M (TM = 8)                                   // workgroups, 256 threa
   out[M] = residual(acc)
 ```
 
-- `--iree-codegen-gpu-mlp-down-k-tile` sets the k2 step (default 16). `0`
+- The since-removed `--iree-codegen-gpu-mlp-down-k-tile` set the k2 step
+  (default 16, now the constant `kDownKTile`). `0`
   removes the k2 loop: `acc[:, N] += h @ Wd[N, :]^T` over the whole 128 chunk
   in one op ("no k2" below). The kernel grows from 1,284 to 6,007 PTX lines
   (1,078 -> 5,667 virtual registers, no local spills in the PTX).
@@ -708,17 +719,17 @@ The header comment of `mlp_fused_v2p3f.cu` still says 256 threads (8 warps);
 - `GPURewriteMLPChainAsForall.cpp`: two new defaults for the IREE-generated
   kernel: the fused gate/up loop is unrolled ×2, and h is computed in
   registers. Together they're about 5–8% faster with bit-identical output.
-- `FormDispatchRegions.cpp`: new `--iree-dispatch-creation-fuse-mlp-min-rows`
-  flag. Gated MLP chains with a static row count below it are left unfused.
-  The default 0 leaves behavior unchanged, including on x86; 2 leaves decode
-  (M = 1) unfused.
+- `FormDispatchRegions.cpp`: gated MLP chains with a static row count below
+  2 are left unfused, i.e. decode (M = 1) stays unfused (also on x86). This
+  was the `--iree-dispatch-creation-fuse-mlp-min-rows` flag (default 0 when
+  this was written); the flag has been removed and 2 is fixed
+  (`kFuseMLPMinRows`).
 
 ### Building the fastest configuration
 
 ```
 cd ~/workspace/tmp/gx10-cuda
 ./compile.sh <name> --iree-dispatch-creation-fuse-mlp=true \
-  --iree-dispatch-creation-fuse-mlp-min-rows=2 \
   "--iree-hal-substitute-executable-source=prefill_bs1\$async_dispatch_28=$HOME/workspace/tmp/gx10-hand/h2p3f.mlir"
 ```
 
@@ -726,6 +737,10 @@ cd ~/workspace/tmp/gx10-cuda
 regenerates the substitution executable (`<name>.mlir`, here `h2p3f.mlir`)
 from the kernel's PTX and compiles a vmfb with it. `h2p3f.mlir` was made from
 `v2p3f.ptx` with 512 threads and 74,496 B.
+
+This configuration is superseded by the one in
+[Attention](DocGPUFuseAttn.md#attention-mask-broadcast-fold-and-hand-written-kernel), which
+also folds the mask broadcast and replaces the attention kernel.
 
 ### First version (`mlp_fused.cu`, 256 threads)
 
@@ -788,3 +803,176 @@ First version against the compiler-generated default:
 Files: x86 `~/workspace/tmp/gx10-hand/` (`mlp_fused.cu`, `mlp_fused.ptx`,
 `mlp_exe.mlir` = substitution executable); `~/workspace/tmp/gx10-cuda/`
 (`hand1.vmfb`, `hand1.compile.log`; outputs `cmp/out_hand1_{512,2048}.npy`).
+
+
+## Attention: mask broadcast fold and hand-written kernel
+
+Moved to [DocGPUFuseAttn.md](DocGPUFuseAttn.md#attention-mask-broadcast-fold-and-hand-written-kernel):
+the mask broadcast fold (then `--iree-dispatch-creation-fuse-attention-mask-broadcast`, now part of `--iree-dispatch-creation-fuse-attention`,
+transient 51.01 MiB at S = 2048) and the hand-written flash attention kernel
+(attention 1,234.8 → 8.0 ms at S = 2048), with the fastest-configuration
+build command.
+
+## IREE's own attention kernel on MMA
+
+Moved to [DocGPUFuseAttn.md](DocGPUFuseAttn.md#irees-own-attention-kernel-on-mma---iree-dispatch-creation-fuse-attention):
+`--iree-dispatch-creation-fuse-attention` (then `--iree-codegen-dim-analysis-load-from-buffer`) lets IREE's attention kernel
+use `mma.sync` (1,236 → 39.4 ms at S = 2048; 23.7 ms with the mask broadcast
+fold).
+
+## QKV fusion on GPU
+
+Moved to [DocGPUFuseQKV.md](DocGPUFuseQKV.md): the GPU side of
+`--iree-dispatch-creation-fuse-qkv` (`GPURewriteQKVChainAsForall`). It is
+correct and saves 3.5 / 7 / 14 MiB more transient at S = 512 / 1024 / 2048,
+but is 0.03–0.13 s slower, so the fastest configuration leaves it off.
+
+## IREE-generated kernel matching the hand kernel
+
+The IREE-generated fused MLP kernel now matches the hand kernel: its output is
+bit-identical to `hand_final` at S = 512 and 2048, and it is within a few
+percent on speed. With it, prefill is faster than the baseline at every S with
+the same memory saving, without the substitution flag.
+
+### What the hand kernel's speed comes from (ablation)
+
+Each row switches off one feature of the hand kernel (`mlp_fused_v4.cu`
+macros). MLP kernel time, nsys, 16 layers:
+
+| Hand-kernel variant | S=512 | S=2048 | vs full hand kernel |
+|---|---:|---:|---:|
+| full hand kernel | 37.3 ms | 120.6 ms | — |
+| 32-bit weight loads (natural k order) | 62.5 | 231.0 | +68% / +92% |
+| N split 2 (gate/up recomputed) | 63.0 | 190.3 | +69% / +58% |
+| … + x from global | 64.6 | 207.6 | |
+| … + acc in shared (≈ IREE's TileAndFuse structure) | 76.1 | 239.1 | +104% / +98% |
+| x from global only | 44.2 | 160.1 | +19% / +33% |
+
+The 32-bit-load variant is bit-identical to the baseline (max |diff| 0), so the
+k reordering within each 32-wide block is what makes the hand kernel's logits
+differ from the baseline (max |diff| 0.06).
+
+### Step 1: 16-byte loads on the TileAndFuse path
+
+- `IREEGPUEnums.td` / `IREEGPUAttrs.cpp`: new virtual intrinsic
+  `VNV_MMA_SYNC_F32_16x8x32_F16`, the NVIDIA counterpart of AMD's `VMFMA`.
+  Lane (g = lane / 4, t = lane % 4) holds A rows [2g, 2g + 2) and B column g for
+  K [8t, 8t + 8), and C rows [2g, 2g + 2) x columns [2t, 2t + 2). Logical rows
+  2g / 2g + 1 are the hardware rows g / g + 8 of `mma.m16n8k16`, and the two
+  native K16 steps take K [4s, 4s + 4) of each lane's 8. A and B (and A and C)
+  agree, so it is the same matmul up to f32 summation order. Lowers to two
+  `mma.sync.m16n8k16`. All layouts have `outer = 1` (virtual intrinsics get no
+  inner-tile expansion).
+- `TilingInterfaceImpl.cpp`: `MapLoadOp`'s scalar lowering skips the
+  per-element bounds check when the padding is `ub.poison` (pure relayout of an
+  in-bounds tensor), only in functions tagged
+  `iree_codegen.mlp_map_load_unchecked`. Without it x is loaded with ~70
+  predicated 2-byte loads.
+
+Together (both alone gave little): MLP kernel 163.7 / 504.2 → 108.7 / 358.9 ms
+at S = 512 / 2048. This is the fallback path now (when the direct path does
+not apply).
+
+### Step 2: the direct path (default)
+
+The remaining gap (no N split, acc in registers, x in shared) is not
+expressible in TileAndFuse, which distributes over warps inside the F loop.
+`GPURewriteMLPChainAsForall` now emits the chain directly as one
+already-distributed kernel (`emitDirectMLPKernel`), sizes taken from the
+matched ops:
+
+```
+scf.forall M (16)                                        // workgroups, 512 threads = 16 warps
+  x[M] -> shared                       [16, H] f16       // K relabeled per 32-block, vector.shuffle
+  acc = 0                              [16, N] f32       // scf.for iter_args: N / 16 cols per warp
+  scf.for K2 (FC = 128)
+    per warp w: gate, up [:, 8w : +8]                    // nvgpu.ldmatrix (x) + 16 B Wg/Wu loads,
+                                                         //   2 k32 blocks in flight, k loop unrolled x16
+    h = act(gate, up)                                    // act body cloned on vectors -> shared (2 buffers)
+    gpu.barrier
+    per warp w: acc[:, w cols] += h @ Wd^T               // ldmatrix (h), Wd in groups of 4 tiles,
+                                                         //   next group's loads before this group's MMAs
+  out[M] = epilogue(residual, acc)                       // epilogue body cloned on vectors
+```
+
+- Applies when the inner M dim is a static multiple of 16 (prefill), H % 32 = 0,
+  F % 128 = 0, N % 512 = 0 and shared memory (2 · (16 · (H + 8) + 2 · 16 · 136)
+  = 74,496 B for llama) fits; otherwise the TileAndFuse MMA / scalar paths run.
+  Decode (M = 1) takes the scalar path.
+- The act and epilogue `linalg.generic` bodies are applied as they are (same
+  f16 arithmetic), and every `vector.load` / `vector.store` carries its
+  `alignment` (16 B for x / weights, 4 B for the 2-element accesses); without
+  the alignment LLVM splits them into 2-byte accesses (62 → 37 ms at S = 512).
+- Tuned: prefetch 2 k32 blocks, x16 unroll of the gate/up k loop, Wd groups of
+  4 (prefetch 3 / unroll 4: 61.7 / 192.8 ms; prefetch 1 / unroll 8:
+  39.6 / 133.2 ms; prefetch 2 / unroll 16: 39.3 / 128.9 ms before the
+  alignment fix).
+- `GPUVerifyDistribution` and `GPUReduceBankConflicts` skip functions tagged
+  `iree_codegen.mlp_direct`: the kernel indexes by `gpu.thread_id` itself, and
+  the bank-conflict padding (+4 halves per row) broke `ldmatrix`'s 16-byte row
+  alignment (the kernel hung; `compute-sanitizer` showed misaligned
+  `__shared__` reads).
+
+### Results
+
+MLP kernel, nsys, 16 layers:
+
+| | S=512 | S=1024 | S=2048 |
+|---|---:|---:|---:|
+| Baseline (3 matmuls) | 82.5 ms | 172.5 ms | 333.8 ms |
+| TileAndFuse MMA path (previous default) | ~164–183 ms | — | ~505 ms |
+| … + virtual intrinsic + unchecked x loads | 111.9 ms | 178.4 ms | 358.4 ms |
+| **Direct path (new default)** | **37.1 ms** | **76.9 ms** | **123.2–124.8 ms** |
+| Hand kernel | 35.4 ms | 77.9 ms | 120.2–120.7 ms |
+
+Prefill wall time, 1 run, decode left unfused
+(the then `--iree-dispatch-creation-fuse-mlp-min-rows=2`, now fixed):
+
+| | S=512 | S=1024 | S=2048 |
+|---|---:|---:|---:|
+| Baseline | 1.39 s | 1.77 s | 3.03 s |
+| **IREE-generated (direct path)** | **1.31 s** | **1.72 s** | **2.83 s** |
+| Hand kernel | 1.37 s | 1.64 s | 2.73 s |
+| Transient buffer vs baseline | −16 MiB | −32 MiB | −64 MiB |
+
+![Prefill wall time](../../tex/png/fig/mlp_prefill_time.png)
+
+(`~/tex/png/fig/mlp_prefill_time.png`, from `python prefill_time.py
+json/mlp_prefill_time_data.json` in `~/tex/png`.)
+
+- Output: bit-identical to the hand kernel at S = 512 and 2048; against the
+  baseline max |diff| 0.06, mean ~0.002, top-1 agreement 100% (S = 512) and
+  99.7% (S = 2048).
+- `DEVICE_LOCAL` peaks identical to the other fused builds; decode matches the
+  baseline (1.06–1.16 s vs 1.13–1.15 s).
+- Wall times are single runs; the S = 512 order of the IREE and hand bars is
+  run-to-run noise (nsys: 37.1 vs 35.4 ms).
+- Unchanged builds: baseline and the TM = 8 scalar path were byte-identical to
+  before; with the direct path off (the since-removed
+  `--iree-codegen-gpu-mlp-direct=false`) the build was byte-identical to the
+  step 1 build.
+
+Build (no substitution flag needed):
+
+```
+cd ~/workspace/tmp/gx10-cuda
+./compile.sh <name> --iree-dispatch-creation-fuse-mlp=true
+```
+
+Flags now: only `--iree-dispatch-creation-fuse-mlp`. The
+`--iree-codegen-gpu-mlp-mma`, `--iree-codegen-gpu-mlp-down-k-tile`,
+`--iree-codegen-gpu-mlp-direct` and `--iree-dispatch-creation-fuse-mlp-min-rows`
+flags were removed: the direct path is always tried first, with the MMA /
+scalar paths as the fallback, and decode (M = 1) is never fused (fusing it costs
+decode GPU time 16 -> 161 ms for 22-32 KiB). The default build is
+byte-identical to the earlier explicit `min-rows=2` build; after the dispatch interface
+changed (7 push constants instead of 4) its MLP kernel ran 36.0 / 123.9 ms at
+S = 512 / 2048, output bit-identical to the hand kernel.
+
+Files changed: `GPURewriteMLPChainAsForall.cpp` (direct path, step 1 kind),
+`Common/Passes.td` and `Common/CMakeLists.txt` (`nvgpu` / `vector` / `memref`
+dependencies), `GPUVerifyDistribution.cpp`, `GPUReduceBankConflicts.cpp`,
+`IREEGPUEnums.td`, `IREEGPUAttrs.cpp`, `TilingInterfaceImpl.cpp`. Benchmarks:
+GX10 `~/llama-mem-cuda/` (`full_direct.vmfb` = `dir_al.vmfb`, `direct_mr.vmfb`,
+`bench_s_direct.log`; ablation `ab_*.vmfb`, kernel
+`~/workspace/tmp/gx10-hand/mlp_fused_v4.cu`).

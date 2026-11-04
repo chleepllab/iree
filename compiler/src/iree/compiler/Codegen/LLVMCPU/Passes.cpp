@@ -490,6 +490,9 @@ void addCPULinalgExtTileAndVectorizePipeline(
       IREE::CPU::TilingLevel::VectorReductionTiles));
   funcPassManager.addPass(
       IREE::LinalgExt::createDecomposeWinogradTransformPass());
+  // Drop the K2 iterations of a causally masked attention whose mask tile is
+  // all -inf (only attentions tagged under fuse-attention).
+  funcPassManager.addPass(createSkipCausalMaskedAttentionTilesPass());
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeAttentionPass());
   funcPassManager.addPass(iree_compiler::createForallToForPass());
 

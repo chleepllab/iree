@@ -17,6 +17,28 @@ namespace mlir::iree_compiler::DispatchCreation {
 inline constexpr llvm::StringLiteral kSpecialQKVAttr =
     "iree_dispatch.special_qkv";
 
+/// Marks the K / V layout transpose (into the paged KV cache's
+/// [pages, heads, 32, head_dim] order) that feeds only a KV-cache scatter, so
+/// dispatch formation puts it in the scatter's dispatch instead of
+/// materializing the transposed K / V.
+inline constexpr llvm::StringLiteral kQKVCacheTransposeAttr =
+    "iree_dispatch.qkv_cache_transpose";
+
+/// Marks an attention whose mask is -inf wherever the key position exceeds
+/// the query position: {delta} with mask == -inf at every iteration point where
+/// lin(K2) - lin(M) + delta > 0, lin being the row-major position over the
+/// attention's K2 (resp. M) dims that the mask's map reads, in increasing
+/// order. Stated that way it is
+/// unchanged by collapsing or expanding dims within those groups. Codegen uses
+/// it to skip fully masked K2 tiles (SkipCausalMaskedAttentionTiles).
+inline constexpr llvm::StringLiteral kCausalMaskAttr =
+    "iree_linalg_ext.causal_mask";
+
+/// Under --iree-dispatch-creation-fuse-attention, tags every attention whose
+/// mask is a generic writing -inf wherever the key position exceeds the query
+/// position with `kCausalMaskAttr`.
+void tagCausalAttentionMasks(FunctionOpInterface funcOp);
+
 /// Under --iree-dispatch-creation-fuse-qkv, rewrites every prefill attention
 /// prologue of the form
 ///
@@ -33,8 +55,14 @@ inline constexpr llvm::StringLiteral kSpecialQKVAttr =
 ///  - the extf / scale / weight generics of the norm are fused into one
 ///    elementwise op that writes `xn`, and the extf into the sum-of-squares
 ///    reduction, so the norm has no [S, D] f32 intermediate.
-/// The RoPE on Q is tagged with `kSpecialQKVAttr`.
+/// The RoPE on Q is tagged with `kSpecialQKVAttr`, and the transposes that
+/// relayout K (the RoPE on K) and V (the V trunc) for a KV-cache scatter with
+/// `kQKVCacheTransposeAttr`.
 void prepareQKVChains(FunctionOpInterface funcOp);
+
+/// The transpose tagged with `kQKVCacheTransposeAttr` that produces the
+/// updates of `scatter`, or null.
+Operation *getQKVCacheTranspose(Operation *scatter);
 
 /// Every op of the chain rooted at the tagged RoPE-on-Q `root`, in the order
 /// they can be appended to its fusion group (outward from the root), except the

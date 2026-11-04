@@ -1234,6 +1234,37 @@ def GPURewriteMLPChainAsForallPass :
     "mlir::linalg::LinalgDialect",
     "mlir::arith::ArithDialect",
     "mlir::gpu::GPUDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::nvgpu::NVGPUDialect",
+    "mlir::vector::VectorDialect",
+    "mlir::iree_compiler::IREE::Codegen::IREECodegenDialect"
+  ];
+}
+
+def GPURewriteQKVChainAsForallPass :
+    InterfacePass<"iree-codegen-gpu-rewrite-qkv-chain-as-forall",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "GPU variant of RewriteQKVChainAsForall for the TileAndFuse "
+                "pipeline";
+
+  let description = [{
+    Same rewrite as RewriteQKVChainAsForall (a workgroup scf.forall over row
+    tiles that normalizes the rows once, then computes Q and K one head at a
+    time with the RoPE as the head's epilogue, and V in head-width chunks),
+    for the LLVMGPU TileAndFuse pipeline. The RoPEs are first rewritten over
+    the [D, 32] rows the rest of the GPU dispatch uses; the projections get
+    mma.sync lowering configs and the norm, truncs and RoPEs thread configs.
+    Rewritten functions are tagged `iree_codegen.qkv_chain_rewritten` so
+    later tiling skips them.
+  }];
+
+  let dependentDialects = [
+    "mlir::affine::AffineDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::gpu::GPUDialect",
     "mlir::iree_compiler::IREE::Codegen::IREECodegenDialect"
   ];
 }
@@ -1261,6 +1292,29 @@ def RewriteQKVChainAsForallPass :
     "mlir::linalg::LinalgDialect",
     "mlir::arith::ArithDialect",
     "mlir::iree_compiler::IREE::Codegen::IREECodegenDialect"
+  ];
+}
+
+def SkipCausalMaskedAttentionTilesPass :
+    InterfacePass<"iree-codegen-skip-causal-masked-attention-tiles",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Stop the K2 loop of a causally masked attention at the last "
+                "tile that is not fully masked";
+
+  let description = [{
+    For an `iree_linalg_ext.online_attention` tagged
+    `iree_linalg_ext.causal_mask` (set in dispatch creation under
+    --iree-dispatch-creation-fuse-attention when the mask is proven to be -inf
+    wherever the key position exceeds the query position) and tiled into an
+    scf.for over K2, lowers the loop's upper bound so that the iterations whose
+    mask tile is entirely -inf are not run. Such a tile changes neither the
+    running max, the sum nor the accumulator (its probabilities are exactly 0
+    and the rescale factor exactly 1), so the result is unchanged.
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
   ];
 }
 

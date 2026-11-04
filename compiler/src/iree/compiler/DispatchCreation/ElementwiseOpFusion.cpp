@@ -18,6 +18,7 @@
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "iree/compiler/DispatchCreation/FusionUtils.h"
 #include "iree/compiler/DispatchCreation/Passes.h"
+#include "iree/compiler/Utils/CustomFusion.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -65,6 +66,19 @@ static bool wouldBroadcastAwayAttentionDimGroup(OpOperand *fusedOperand) {
     return false;
   }
   IREE::LinalgExt::AttentionOpDetail opInfo = std::move(*maybeOpInfo);
+
+  // The dim groups come from the Q/K/V/O maps only, so the mask may drop any
+  // of them (e.g. a [S, S] causal mask broadcast over the batch/head dims).
+  // Part of --iree-dispatch-creation-fuse-qkv and -fuse-attention.
+  if (isAttentionMaskBroadcastFoldEnabled()) {
+    if (auto attentionOp =
+            dyn_cast<IREE::LinalgExt::AttentionOp>(consumer)) {
+      MutableOperandRange mask = attentionOp.getMaskMutable();
+      if (mask.size() == 1 && &mask[0] == fusedOperand) {
+        return false;
+      }
+    }
+  }
 
   auto producer = dyn_cast_if_present<linalg::LinalgOp>(
       fusedOperand->get().getDefiningOp());

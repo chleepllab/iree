@@ -36,14 +36,14 @@
 // - The [TM, N] accumulator and the gate/up/h chunks are the destinations of
 //   thread foralls, so GPUInferMemorySpace puts them in shared memory. TM is
 //   fixed at 8 (1 for decode); down's thread tile is [TM, 16] with K in
-//   serial steps of --iree-codegen-gpu-mlp-down-k-tile (16).
+//   serial steps of kDownKTile (16).
 //
 // - Every lowering_config in the function is dropped, so the matmul-specific
 //   TileAndFuse steps (operand promotion, packing to MMA intrinsics, the
 //   reduction/thread/subgroup tiling levels) find nothing to act on.
 //
-// MMA path (--iree-codegen-gpu-mlp-mma, the default; needs the inner M dim to
-// be a multiple of 16, i.e. prefill -- decode keeps the scalar path): TM is
+// MMA path (used whenever the inner M dim is a multiple of 16, i.e. prefill
+// -- decode keeps the scalar path), when the direct path does not apply: TM is
 // one intrinsic (16 rows) and N is also split across workgroups
 // (kMMANTile = 1024), so the [16, nTile] accumulator fits in shared memory;
 // gate/up are recomputed once per N tile. Inside each F chunk, down walks the
@@ -55,6 +55,16 @@
 // fused into another (h reaches down through an iree_gpu.value_barrier).
 // After GPUFuseAndHoistParallelLoops, gate's and up's k loops are fused into
 // one (GPUFuseMLPGateUpLoops), so each x slice is loaded once for both.
+//
+// Direct path (always taken when it applies: prefill-shaped chains whose
+// sizes fit, see emitDirectMLPKernel): the chain is
+// emitted as one already-distributed SIMT kernel instead -- 16 rows x all N
+// columns per workgroup (no N split, gate/up computed once), acc in registers
+// across the F loop, x staged in shared memory (ldmatrix), 16-byte weight
+// loads with K relabeled per 32-block, h in registers -> shared. GX10 MLP
+// kernel time, prefill S = 512 / 1024 / 2048: 37.1 / 76.9 / 123.2 ms (baseline
+// matmuls 82.5 / 172.5 / 333.8 ms; MMA path below 111.9 / 178.4 / 358.4 ms).
+// The MMA / scalar paths below remain the fallback.
 //
 // The function is tagged `iree_codegen.mlp_chain_rewritten` so
 // TileAndDistributeToWorkgroupsUsingForall leaves it alone.
@@ -74,10 +84,14 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
@@ -88,20 +102,6 @@ namespace mlir::iree_compiler {
 
 #define GEN_PASS_DEF_GPUREWRITEMLPCHAINASFORALLPASS
 #include "iree/compiler/Codegen/Common/Passes.h.inc"
-
-static llvm::cl::opt<bool> clMLPUseMMA(
-    "iree-codegen-gpu-mlp-mma",
-    llvm::cl::desc("Lower the projections of the rewritten MLP chain with MMA "
-                   "intrinsics (TM = 16, N split across workgroups) instead of "
-                   "per-thread FMAs."),
-    llvm::cl::init(true), llvm::cl::Hidden);
-
-static llvm::cl::opt<int64_t> clMLPDownKTile(
-    "iree-codegen-gpu-mlp-down-k-tile",
-    llvm::cl::desc("Scalar path: serial K step of down inside each thread "
-                   "(the `scf.for k2` loop); 0 reduces the whole F chunk in "
-                   "one op."),
-    llvm::cl::init(16), llvm::cl::Hidden);
 
 namespace {
 
@@ -121,6 +121,9 @@ static constexpr int64_t kMaxRowTile = 8;
 // N strip of `down` each thread owns (all TM rows of it): the inner
 // `scf.for N (16)` of the schedule, distributed over the threads.
 static constexpr int64_t kDownThreadN = 16;
+// Scalar path: serial K step of down inside each thread (the `scf.for k2`
+// loop over the 128-wide F chunk).
+static constexpr int64_t kDownKTile = 16;
 // Used when the target does not say (CUDA's static shared memory limit).
 static constexpr int64_t kDefaultWorkgroupMemoryBytes = 48 * 1024;
 // Threads per workgroup. Every op is distributed over all of them, so this
@@ -426,7 +429,8 @@ static LogicalResult distributeToThreads(RewriterBase &rewriter,
 /// subgroup taking one intrinsic along M and `subgroupN` along N, and the K dim
 /// tiled to `reductionK` intrinsics (0: left whole).
 static IREE::GPU::LoweringConfigAttr
-getProjectionMMAConfig(MLIRContext *ctx, IREE::GPU::MMAAttr kind,
+getProjectionMMAConfig(MLIRContext *ctx,
+                       IREE::Codegen::InnerTileDescAttrInterface kind,
                        int64_t numLoops, int64_t subgroupN, int64_t reductionK,
                        bool promote) {
   Builder b(ctx);
@@ -459,9 +463,10 @@ static constexpr StringLiteral kMLPDownWarpKKey = "mlp_down_warp_k";
 /// producers without one): h is computed once per chunk, not once per down
 /// subgroup tile. The fills and the epilogue are left to
 /// GPUGreedilyDistributeToThreads.
-static LogicalResult setMMAConfigs(scf::ForallOp forallOp,
-                                   IREE::GPU::MMAAttr kind, int64_t nTile,
-                                   int64_t numSubgroups) {
+static LogicalResult
+setMMAConfigs(scf::ForallOp forallOp,
+              IREE::Codegen::InnerTileDescAttrInterface kind, int64_t nTile,
+              int64_t numSubgroups) {
   MLIRContext *ctx = forallOp.getContext();
   linalg::LinalgOp down;
   forallOp.walk([&](linalg::LinalgOp op) {
@@ -481,7 +486,13 @@ static LogicalResult setMMAConfigs(scf::ForallOp forallOp,
   if (!gate || !up) {
     return failure();
   }
-  auto [intrinsicM, intrinsicN, intrinsicK] = kind.getMNKShape();
+  int64_t intrinsicM, intrinsicN, intrinsicK;
+  if (auto v = dyn_cast<IREE::GPU::VirtualMMAAttr>(kind)) {
+    std::tie(intrinsicM, intrinsicN, intrinsicK) = v.getMNKShape();
+  } else {
+    std::tie(intrinsicM, intrinsicN, intrinsicK) =
+        cast<IREE::GPU::MMAAttr>(kind).getMNKShape();
+  }
   int64_t chunkTilesN = kFfnChunk / intrinsicN;
   int64_t downTilesN = nTile / intrinsicN;
   if (intrinsicM != kMMARowTile || chunkTilesN % numSubgroups != 0 ||
@@ -492,7 +503,8 @@ static LogicalResult setMMAConfigs(scf::ForallOp forallOp,
   for (linalg::LinalgOp proj : {gate, up}) {
     setLoweringConfig(proj, getProjectionMMAConfig(
                                 ctx, kind, numLoops, chunkTilesN / numSubgroups,
-                                kMMAReductionK, kMMAPromote));
+                                kMMAReductionK * 16 / intrinsicK,
+                                kMMAPromote));
   }
   int64_t tn = std::min(kMMADownNTile, nTile);
   int64_t tk = std::min(kMMADownKTile, kFfnChunk);
@@ -550,10 +562,471 @@ static LogicalResult setMMAConfigs(scf::ForallOp forallOp,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// Direct path: the whole chain as one SIMT kernel (no TileAndFuse levels).
+//===----------------------------------------------------------------------===//
+
+// Direct path parameters. One workgroup: kDirectRows rows x all N columns.
+static constexpr int64_t kDirectRows = 16;   // one mma.m16n8k16 M tile
+static constexpr int64_t kDirectWarps = 16;  // 512 threads
+static constexpr int64_t kDirectChunk = 128; // F chunk (h tile width)
+static constexpr int64_t kDirectGroup = 4;   // down n-tiles per load group
+static constexpr int64_t kDirectPrefetch = 2; // gate/up k32 blocks in flight
+static constexpr int64_t kDirectUnroll = 16;  // gate/up k loop unroll
+
+/// The 2-D buffer a chain operand was loaded from: through tensor/memref
+/// expand_shapes back to the binding subspan.
+static Value getChainBuffer(Value v) {
+  while (auto e = v.getDefiningOp<tensor::ExpandShapeOp>()) {
+    v = e.getSrc();
+  }
+  auto load = v.getDefiningOp<IREE::Codegen::LoadFromBufferOp>();
+  if (!load) {
+    return {};
+  }
+  Value m = load.getBuffer();
+  while (auto e = m.getDefiningOp<memref::ExpandShapeOp>()) {
+    m = e.getSrc();
+  }
+  return m;
+}
+
+/// Sets the byte alignment of a vector.load / vector.store (all accesses of
+/// the direct kernel are aligned by construction; without it LLVM splits the
+/// unaligned-looking ones into 2-byte accesses).
+static Value alignedLoad(Value loadResult, int64_t bytes) {
+  loadResult.getDefiningOp()->setAttr(
+      "alignment",
+      IntegerAttr::get(IntegerType::get(loadResult.getContext(), 64), bytes));
+  return loadResult;
+}
+static void alignedStore(Operation *op, int64_t bytes) {
+  op->setAttr("alignment",
+              IntegerAttr::get(IntegerType::get(op->getContext(), 64), bytes));
+}
+
+/// Applies the elementwise body of `generic` (all inputs and the result
+/// elementwise, identity maps) to vector values `ins`: every body op is
+/// recreated on vector types; values defined outside the body are broadcast.
+static Value applyElementwiseBody(OpBuilder &b, Location loc,
+                                  linalg::GenericOp generic, ValueRange ins,
+                                  int64_t width) {
+  IRMapping map;
+  Block *body = generic.getBody();
+  for (auto [arg, v] : llvm::zip(body->getArguments().take_front(ins.size()),
+                                 ins)) {
+    map.map(arg, v);
+  }
+  auto vecOf = [&](Type t) -> Type { return VectorType::get({width}, t); };
+  for (Operation &op : body->without_terminator()) {
+    SmallVector<Value> operands;
+    for (Value o : op.getOperands()) {
+      if (map.contains(o)) {
+        operands.push_back(map.lookup(o));
+      } else {
+        operands.push_back(vector::BroadcastOp::create(
+            b, loc, cast<VectorType>(vecOf(o.getType())), o));
+      }
+    }
+    OperationState state(loc, op.getName());
+    state.addOperands(operands);
+    for (Type t : op.getResultTypes()) {
+      state.addTypes(vecOf(t));
+    }
+    state.addAttributes(op.getAttrs());
+    Operation *newOp = b.create(state);
+    map.map(op.getResults(), newOp->getResults());
+  }
+  return map.lookup(body->getTerminator()->getOperand(0));
+}
+
+/// Emits the chain as one kernel, modeled on a hand-written CUDA kernel:
+///   forall workgroups (16 rows of M):
+///     x[16, H] -> shared (K relabeled in 32-blocks so each lane's B fragment
+///                 of an mma.m16n8k16 pair is one 16-byte load)
+///     acc[16, N] in registers (warp w owns N / 16 columns)
+///     for each F chunk of 128:
+///       gate/up: warp w computes 8 columns, Wg/Wu streamed from global with
+///                kDirectPrefetch k32 blocks in flight, x via ldmatrix
+///       h = act(gate, up) in registers -> shared (double buffered)
+///       barrier
+///       down: acc += h @ Wd[:, chunk]^T, Wd in groups of kDirectGroup tiles,
+///             the next group's loads issued before this group's MMAs
+///     out = epilogue(residual, acc)
+/// The act / epilogue bodies are applied as they are (same f16 arithmetic).
+static LogicalResult emitDirectMLPKernel(RewriterBase &rewriter,
+                                         FunctionOpInterface funcOp,
+                                         MLPChainMatch &match) {
+  MLIRContext *ctx = rewriter.getContext();
+  // Rows: the inner M dim of the (split) chain must hold whole 16-row tiles.
+  auto outType = cast<ShapedType>(match.down->getResult(0).getType());
+  if (outType.getRank() < 2) {
+    return failure();
+  }
+  int64_t mInner = outType.getDimSize(outType.getRank() - 2);
+  if (ShapedType::isDynamic(mInner) || mInner % kDirectRows != 0) {
+    return failure();
+  }
+  Value xBuf = getChainBuffer(match.gate.getDpsInputs()[0]);
+  Value wgBuf = getChainBuffer(match.gate.getDpsInputs()[1]);
+  Value wuBuf = getChainBuffer(match.up.getDpsInputs()[1]);
+  Value wdBuf = getChainBuffer(match.down.getDpsInputs()[1]);
+  Value resBuf;
+  int downInput = -1;
+  for (auto [i, in] : llvm::enumerate(match.epilogue.getDpsInputs())) {
+    if (in == match.down->getResult(0)) {
+      downInput = i;
+    } else {
+      resBuf = getChainBuffer(in);
+    }
+  }
+  IREE::Codegen::StoreToBufferOp store;
+  for (Operation *user : match.epilogue->getResult(0).getUsers()) {
+    store = dyn_cast<IREE::Codegen::StoreToBufferOp>(user);
+  }
+  if (!xBuf || !wgBuf || !wuBuf || !wdBuf || !resBuf || !store ||
+      downInput < 0 || match.epilogue.getNumDpsInputs() != 2 ||
+      match.act.getNumDpsInputs() != 2) {
+    return failure();
+  }
+  Value outBuf = store.getBuffer();
+  while (auto e = outBuf.getDefiningOp<memref::ExpandShapeOp>()) {
+    outBuf = e.getSrc();
+  }
+  auto memType = [](Value v) { return cast<MemRefType>(v.getType()); };
+  for (Value v : {xBuf, wgBuf, wuBuf, wdBuf, resBuf, outBuf}) {
+    if (memType(v).getRank() != 2 || !memType(v).getElementType().isF16()) {
+      return failure();
+    }
+  }
+  int64_t h = memType(xBuf).getDimSize(1);
+  int64_t f = memType(wgBuf).getDimSize(0);
+  int64_t n = memType(wdBuf).getDimSize(0);
+  if (ShapedType::isDynamic(h) || ShapedType::isDynamic(f) ||
+      ShapedType::isDynamic(n) || memType(wgBuf).getDimSize(1) != h ||
+      memType(wuBuf).getShape() != memType(wgBuf).getShape() ||
+      memType(wdBuf).getDimSize(1) != f || h % 32 != 0 ||
+      f % kDirectChunk != 0 || kDirectChunk / kDirectWarps != 8 ||
+      n % (kDirectWarps * 8 * kDirectGroup) != 0 ||
+      memType(resBuf).getDimSize(1) != n ||
+      memType(outBuf).getDimSize(1) != n) {
+    return failure();
+  }
+  const int64_t xsStride = h + 8, hsStride = kDirectChunk + 8;
+  int64_t sharedBytes = 2 * (kDirectRows * xsStride +
+                             2 * kDirectRows * hsStride);
+  int64_t limit = kDefaultWorkgroupMemoryBytes;
+  if (IREE::GPU::TargetAttr target = getGPUTargetAttr(funcOp)) {
+    limit = target.getWgp().getMaxWorkgroupMemoryBytes();
+    if (kDirectWarps * 32 > target.getWgp().getMaxThreadCountPerWorkgroup()) {
+      return failure();
+    }
+  }
+  if (sharedBytes > limit) {
+    return failure();
+  }
+  const int64_t wcols = n / kDirectWarps;  // down columns per warp
+  const int64_t ntDown = wcols / 8;
+  // Which act input is gate (the order of the body's arguments).
+  SmallVector<int> actFromGate;
+  for (Value in : match.act.getDpsInputs()) {
+    Operation *def = in.getDefiningOp();
+    if (def == match.gate.getOperation()) {
+      actFromGate.push_back(1);
+    } else if (def == match.up.getOperation()) {
+      actFromGate.push_back(0);
+    } else {
+      return failure();
+    }
+  }
+
+  Location loc = store.getLoc();
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(store);
+  auto cst = [&](int64_t v) -> Value {
+    return arith::ConstantIndexOp::create(rewriter, loc, v);
+  };
+  Type f16 = rewriter.getF16Type(), f32 = rewriter.getF32Type();
+  auto vA = VectorType::get({4, 2}, f16);
+  auto vB = VectorType::get({2, 2}, f16);
+  auto vC = VectorType::get({2, 2}, f32);
+  auto v8 = VectorType::get({8}, f16);
+  Value m = memref::DimOp::create(rewriter, loc, xBuf, 0);
+  Value numWG = arith::DivUIOp::create(rewriter, loc, m, cst(kDirectRows));
+  auto mapping = rewriter.getArrayAttr(
+      {IREE::Codegen::WorkgroupMappingAttr::get(
+          ctx, IREE::Codegen::WorkgroupId::IdX)});
+  auto forall = scf::ForallOp::create(
+      rewriter, loc, ArrayRef<OpFoldResult>{numWG}, ValueRange{}, mapping,
+      /*bodyBuilderFn=*/nullptr);
+  OpBuilder b = OpBuilder::atBlockBegin(forall.getBody());
+  // `cst` uses rewriter; inside the forall use b.
+  auto c = [&](int64_t v) -> Value {
+    return arith::ConstantIndexOp::create(b, loc, v);
+  };
+  auto add = [&](Value x, Value y) -> Value {
+    return arith::AddIOp::create(b, loc, x, y);
+  };
+  auto mul = [&](Value x, int64_t y) -> Value {
+    return arith::MulIOp::create(b, loc, x, c(y));
+  };
+  Value m0 = mul(forall.getInductionVar(0), kDirectRows);
+  Value tid = gpu::ThreadIdOp::create(b, loc, gpu::Dimension::x);
+  Value lane = arith::RemUIOp::create(b, loc, tid, c(32));
+  Value warp = arith::DivUIOp::create(b, loc, tid, c(32));
+  Value g = arith::DivUIOp::create(b, loc, lane, c(4));
+  Value t = arith::RemUIOp::create(b, loc, lane, c(4));
+  Value t8 = mul(t, 8);
+  Value aRow = arith::RemUIOp::create(b, loc, lane, c(16));
+  Value aCol = mul(arith::DivUIOp::create(b, loc, lane, c(16)), 8);
+
+  auto wgSpace =
+      gpu::AddressSpaceAttr::get(ctx,
+                                 gpu::GPUDialect::getWorkgroupAddressSpace());
+  auto xsType = MemRefType::get({kDirectRows, xsStride}, f16,
+                                MemRefLayoutAttrInterface{}, wgSpace);
+  auto hsType = MemRefType::get({2, kDirectRows, hsStride}, f16,
+                                MemRefLayoutAttrInterface{}, wgSpace);
+  Value xs = memref::AllocOp::create(b, loc, xsType);
+  Value hs = memref::AllocOp::create(b, loc, hsType);
+
+  // ---- x tile -> shared, K relabeled: logical word 4q + t <- physical 4t + q.
+  {
+    int64_t blocks = kDirectRows * (h / 32);
+    auto loop = scf::ForOp::create(b, loc, tid, c(blocks),
+                                   c(kDirectWarps * 32));
+    OpBuilder lb = OpBuilder::atBlockBegin(loop.getBody());
+    Value blk = loop.getInductionVar();
+    Value nkb = arith::ConstantIndexOp::create(lb, loc, h / 32);
+    Value row = arith::DivUIOp::create(lb, loc, blk, nkb);
+    Value kb = arith::RemUIOp::create(lb, loc, blk, nkb);
+    Value col = arith::MulIOp::create(
+        lb, loc, kb, arith::ConstantIndexOp::create(lb, loc, 32));
+    Value grow = arith::AddIOp::create(lb, loc, m0, row);
+    Value v = alignedLoad(vector::LoadOp::create(lb, loc,
+                                             VectorType::get({32}, f16), xBuf,
+                                             ValueRange{grow, col}),
+                      16);
+    auto i32x16 = VectorType::get({16}, lb.getI32Type());
+    Value words = vector::BitCastOp::create(lb, loc, i32x16, v);
+    SmallVector<int64_t> mask(16);
+    for (int64_t q = 0; q < 4; ++q) {
+      for (int64_t tt = 0; tt < 4; ++tt) {
+        mask[4 * q + tt] = 4 * tt + q;
+      }
+    }
+    Value shuf = vector::ShuffleOp::create(lb, loc, words, words, mask);
+    Value back =
+        vector::BitCastOp::create(lb, loc, VectorType::get({32}, f16), shuf);
+    alignedStore(
+        vector::StoreOp::create(lb, loc, back, xs, ValueRange{row, col}), 16);
+  }
+  gpu::BarrierOp::create(b, loc);
+
+  auto ldsm = [&](OpBuilder &ob, Value mem, ValueRange idx) -> Value {
+    return nvgpu::LdMatrixOp::create(ob, loc, vA, mem, idx,
+                                     /*transpose=*/false, /*numTiles=*/4);
+  };
+  auto mma = [&](OpBuilder &ob, Value a, Value b8, int64_t s,
+                 Value acc) -> Value {
+    Value bs = vector::ExtractStridedSliceOp::create(
+        ob, loc, b8, ArrayRef<int64_t>{4 * s}, ArrayRef<int64_t>{4},
+        ArrayRef<int64_t>{1});
+    bs = vector::ShapeCastOp::create(ob, loc, vB, bs);
+    return nvgpu::MmaSyncOp::create(ob, loc, a, bs, acc,
+                                    ArrayRef<int64_t>{16, 8, 16});
+  };
+  Value zeroC = arith::ConstantOp::create(
+      b, loc, vC, DenseElementsAttr::get(vC, b.getF32FloatAttr(0.f)));
+
+  // ---- F chunk loop, acc tiles as iter_args.
+  SmallVector<Value> accInit(ntDown, zeroC);
+  auto chunkLoop = scf::ForOp::create(b, loc, c(0), c(f), c(kDirectChunk),
+                                      accInit);
+  {
+    OpBuilder cb = OpBuilder::atBlockBegin(chunkLoop.getBody());
+    auto cc = [&](int64_t v) -> Value {
+      return arith::ConstantIndexOp::create(cb, loc, v);
+    };
+    Value k2 = chunkLoop.getInductionVar();
+    SmallVector<Value> acc(chunkLoop.getRegionIterArgs().begin(),
+                           chunkLoop.getRegionIterArgs().end());
+    // gate / up rows of this lane: k2 + 8 * warp + g.
+    Value wrow = arith::AddIOp::create(
+        cb, loc, k2,
+        arith::AddIOp::create(cb, loc,
+                              arith::MulIOp::create(cb, loc, warp, cc(8)), g));
+    auto ldW = [&](OpBuilder &ob, Value mem, Value row, Value col) -> Value {
+      return alignedLoad(
+          vector::LoadOp::create(ob, loc, v8, mem, ValueRange{row, col}), 16);
+    };
+    auto kcol = [&](OpBuilder &ob, Value kb) -> Value {
+      return arith::AddIOp::create(
+          ob, loc,
+          arith::MulIOp::create(ob, loc, kb,
+                                arith::ConstantIndexOp::create(ob, loc, 32)),
+          t8);
+    };
+    SmallVector<Value> kbInit = {zeroC, zeroC};
+    for (int64_t p = 0; p < kDirectPrefetch; ++p) {
+      kbInit.push_back(ldW(cb, wgBuf, wrow, kcol(cb, cc(p))));
+      kbInit.push_back(ldW(cb, wuBuf, wrow, kcol(cb, cc(p))));
+    }
+    auto kbLoop =
+        scf::ForOp::create(cb, loc, cc(0), cc(h / 32), cc(1), kbInit);
+    {
+      OpBuilder kb_ = OpBuilder::atBlockBegin(kbLoop.getBody());
+      Value kb = kbLoop.getInductionVar();
+      auto args = kbLoop.getRegionIterArgs();
+      Value ga = args[0], ua = args[1];
+      Value nk = arith::MinUIOp::create(
+          kb_, loc,
+          arith::AddIOp::create(
+              kb_, loc, kb,
+              arith::ConstantIndexOp::create(kb_, loc, kDirectPrefetch)),
+          arith::ConstantIndexOp::create(kb_, loc, h / 32 - 1));
+      Value ng = ldW(kb_, wgBuf, wrow, kcol(kb_, nk));
+      Value nu = ldW(kb_, wuBuf, wrow, kcol(kb_, nk));
+      for (int64_t s = 0; s < 2; ++s) {
+        Value colA = arith::AddIOp::create(
+            kb_, loc,
+            arith::MulIOp::create(kb_, loc, kb,
+                                  arith::ConstantIndexOp::create(kb_, loc, 32)),
+            arith::AddIOp::create(
+                kb_, loc, arith::ConstantIndexOp::create(kb_, loc, 16 * s),
+                aCol));
+        Value a = ldsm(kb_, xs, ValueRange{aRow, colA});
+        ga = mma(kb_, a, args[2], s, ga);
+        ua = mma(kb_, a, args[3], s, ua);
+      }
+      SmallVector<Value> yields = {ga, ua};
+      for (int64_t p = 1; p < kDirectPrefetch; ++p) {
+        yields.push_back(args[2 + 2 * p]);
+        yields.push_back(args[3 + 2 * p]);
+      }
+      yields.push_back(ng);
+      yields.push_back(nu);
+      scf::YieldOp::create(kb_, loc, yields);
+    }
+    Value ga = kbLoop.getResult(0), ua = kbLoop.getResult(1);
+    // ---- h = act(gate, up) -> hs[chunk % 2], K relabeled like x.
+    Value buf = arith::RemUIOp::create(
+        cb, loc, arith::DivUIOp::create(cb, loc, k2, cc(kDirectChunk)), cc(2));
+    // Physical f (within the chunk) of this lane's pair: 8 * warp + 2t;
+    // logical position: (f & ~31) + 8 * ((f >> 1) & 3) + 2 * (f >> 3 & 3).
+    Value fpos = arith::AddIOp::create(
+        cb, loc, arith::MulIOp::create(cb, loc, warp, cc(8)),
+        arith::MulIOp::create(cb, loc, t, cc(2)));
+    Value fblk = arith::MulIOp::create(
+        cb, loc, arith::DivUIOp::create(cb, loc, fpos, cc(32)), cc(32));
+    Value fin = arith::RemUIOp::create(cb, loc, fpos, cc(32));
+    Value tt = arith::DivUIOp::create(cb, loc, fin, cc(8));
+    Value q = arith::RemUIOp::create(
+        cb, loc, arith::DivUIOp::create(cb, loc, fin, cc(2)), cc(4));
+    Value lpos = arith::AddIOp::create(
+        cb, loc, fblk,
+        arith::AddIOp::create(cb, loc,
+                              arith::MulIOp::create(cb, loc, q, cc(8)),
+                              arith::MulIOp::create(cb, loc, tt, cc(2))));
+    for (int64_t r = 0; r < 2; ++r) {
+      Value gr = vector::ExtractOp::create(cb, loc, ga, ArrayRef<int64_t>{r});
+      Value ur = vector::ExtractOp::create(cb, loc, ua, ArrayRef<int64_t>{r});
+      SmallVector<Value> ins;
+      for (int fromGate : actFromGate) {
+        ins.push_back(fromGate ? gr : ur);
+      }
+      Value hv = applyElementwiseBody(cb, loc, match.act, ins, 2);
+      Value hrow = arith::AddIOp::create(cb, loc, g, cc(8 * r));
+      alignedStore(
+          vector::StoreOp::create(cb, loc, hv, hs, ValueRange{buf, hrow, lpos}),
+          4);
+    }
+    gpu::BarrierOp::create(cb, loc);
+    // ---- down.
+    Value wdRow0 = arith::AddIOp::create(
+        cb, loc, arith::MulIOp::create(cb, loc, warp, cc(wcols)), g);
+    const int64_t ng = ntDown / kDirectGroup;
+    const int64_t steps = (kDirectChunk / 32) * ng;
+    auto loadGroup = [&](int64_t st) {
+      int64_t kbi = st / ng, gi = st % ng;
+      Value col = arith::AddIOp::create(
+          cb, loc, k2, arith::AddIOp::create(cb, loc, cc(kbi * 32), t8));
+      SmallVector<Value> vs;
+      for (int64_t i = 0; i < kDirectGroup; ++i) {
+        Value row = arith::AddIOp::create(
+            cb, loc, wdRow0, cc((gi * kDirectGroup + i) * 8));
+        vs.push_back(ldW(cb, wdBuf, row, col));
+      }
+      return vs;
+    };
+    SmallVector<Value> cur = loadGroup(0);
+    for (int64_t st = 0; st < steps; ++st) {
+      SmallVector<Value> next;
+      if (st + 1 < steps) {
+        next = loadGroup(st + 1);
+      }
+      int64_t kbi = st / ng, gi = st % ng;
+      Value a0 = ldsm(cb, hs,
+                      ValueRange{buf, aRow,
+                                 arith::AddIOp::create(cb, loc, cc(kbi * 32),
+                                                       aCol)});
+      Value a1 = ldsm(cb, hs,
+                      ValueRange{buf, aRow,
+                                 arith::AddIOp::create(
+                                     cb, loc, cc(kbi * 32 + 16), aCol)});
+      for (int64_t i = 0; i < kDirectGroup; ++i) {
+        int64_t tile = gi * kDirectGroup + i;
+        acc[tile] = mma(cb, a0, cur[i], 0, acc[tile]);
+        acc[tile] = mma(cb, a1, cur[i], 1, acc[tile]);
+      }
+      cur = next;
+    }
+    scf::YieldOp::create(cb, loc, acc);
+    if (kDirectUnroll > 1) {
+      (void)loopUnrollByFactor(kbLoop, kDirectUnroll);
+    }
+  }
+
+  // ---- out = epilogue(residual, acc).
+  for (int64_t i = 0; i < ntDown; ++i) {
+    Value col = add(add(mul(warp, wcols), c(i * 8)), mul(t, 2));
+    for (int64_t r = 0; r < 2; ++r) {
+      Value row = add(m0, add(g, c(8 * r)));
+      Value accRow = vector::ExtractOp::create(b, loc, chunkLoop.getResult(i),
+                                               ArrayRef<int64_t>{r});
+      Value resv =
+          alignedLoad(vector::LoadOp::create(b, loc, VectorType::get({2}, f16),
+                                         resBuf, ValueRange{row, col}),
+                  4);
+      SmallVector<Value> ins(2);
+      ins[downInput] = accRow;
+      ins[1 - downInput] = resv;
+      Value o = applyElementwiseBody(b, loc, match.epilogue, ins, 2);
+      alignedStore(
+          vector::StoreOp::create(b, loc, o, outBuf, ValueRange{row, col}), 4);
+    }
+  }
+
+  rewriter.eraseOp(store);
+  funcOp->setAttr("iree_codegen.mlp_direct", UnitAttr::get(ctx));
+  IREE::Codegen::TranslationInfoAttr info = getTranslationInfo(funcOp);
+  // (GPUReduceBankConflicts skips iree_codegen.mlp_direct functions: the
+  // shared buffers are already padded, and ldmatrix needs 16-byte rows.)
+  (void)setTranslationInfo(
+      funcOp, IREE::Codegen::TranslationInfoAttr::get(
+                  ctx, info.getPassPipeline(), info.getCodegenSpec(),
+                  ArrayRef<int64_t>{kDirectWarps * 32, 1, 1}, 32,
+                  info.getConfiguration()));
+  return success();
+}
+
 static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
                                      FunctionOpInterface funcOp,
                                      MLPChainMatch &match) {
   MLIRContext *ctx = rewriter.getContext();
+  if (succeeded(emitDirectMLPKernel(rewriter, funcOp, match))) {
+    return success();
+  }
   auto outType = cast<ShapedType>(match.down->getResult(0).getType());
   int64_t rank = outType.getRank();
   int64_t n = outType.getDimSize(rank - 1);
@@ -582,11 +1055,17 @@ static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
   int64_t rowTile = pickRowTile(mInner);
   // MMA path: one intrinsic of rows, and N split so the [TM, nTile] f32
   // accumulator plus the chunk buffers fit in workgroup memory.
-  auto mmaKind = IREE::GPU::MMAAttr::get(
-      ctx, IREE::GPU::MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_F16);
+  // 16x8x32 virtual mma.sync: two m16n8k16 with K (and M) permuted so each
+  // lane's A/B operands are 8 contiguous K elements, i.e. 16-byte loads.
+  // Same matmul up to f32 summation order (not bit-identical to the native
+  // 16x8x16 order). GX10 MLP kernel time, prefill S = 512 / 2048, with the
+  // unchecked x loads below: 163.7 / 504.2 -> 108.7 / 358.9 ms.
+  IREE::Codegen::InnerTileDescAttrInterface mmaKind =
+      IREE::GPU::VirtualMMAAttr::get(
+          ctx, IREE::GPU::VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16);
   int64_t nTile = kMMANTile;
   int64_t subgroupSize = info.getSubgroupSize() ? info.getSubgroupSize() : 32;
-  bool useMMA = clMLPUseMMA && !ShapedType::isDynamic(mInner) &&
+  bool useMMA = !ShapedType::isDynamic(mInner) &&
                 mInner % kMMARowTile == 0 && nTile > 0 && n % nTile == 0 &&
                 numThreads % subgroupSize == 0;
   if (useMMA) {
@@ -731,7 +1210,7 @@ static LogicalResult rewriteMLPChain(RewriterBase &rewriter,
     if (op->hasAttr(kMLPDownAttr) && op->getParentOfType<scf::ForOp>()) {
       forced.assign(op.getNumLoops(), 0);
       forced[op.getNumLoops() - 2] = kDownThreadN;
-      reductionStep = clMLPDownKTile;
+      reductionStep = kDownKTile;
     }
     op->removeAttr(kMLPDownAttr);
     if (failed(distributeToThreads(rewriter, op, numThreads, forced,
@@ -775,6 +1254,11 @@ struct GPURewriteMLPChainAsForallPass final
       return signalPassFailure();
     }
     funcOp->setAttr(kMLPChainRewrittenAttr, UnitAttr::get(&getContext()));
+    // The chain's map_loads only relayout in-bounds tensors: let their
+    // lowering skip the per-element bounds check (MapLoadOp scalar
+    // implementation), so x's loads become vector loads.
+    funcOp->setAttr("iree_codegen.mlp_map_load_unchecked",
+                    UnitAttr::get(&getContext()));
   }
 };
 

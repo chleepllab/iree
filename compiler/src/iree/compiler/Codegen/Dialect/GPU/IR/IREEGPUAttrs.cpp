@@ -1157,6 +1157,8 @@ SmallVector<VirtualMMAIntrinsic> MMAAttr::getVirtualIntrinsics() const {
     return {VirtualMMAIntrinsic::VMFMA_F32_16x16x32_F8E4M3FNUZ};
   case MMAIntrinsic::MFMA_F32_32x32x16_F8E4M3FNUZ:
     return {VirtualMMAIntrinsic::VMFMA_F32_32x32x16_F8E4M3FNUZ};
+  case MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_F16:
+    return {VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16};
   default:
     return {};
   }
@@ -1635,6 +1637,8 @@ getMNKShape(VirtualMMAIntrinsic type) {
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x64x1_F16:
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x64x1_BF16:
     return {8, 16, 64};
+  case VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16:
+    return {16, 8, 32};
   case VirtualMMAIntrinsic::VDMFMA_I32_8x16x128x2_I8:
   case VirtualMMAIntrinsic::VDMFMA_I32_8x16x128x1_I8:
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x2_F8E5M2FNUZ:
@@ -1684,6 +1688,8 @@ getABCElementTypes(MLIRContext *context, VirtualMMAIntrinsic type) {
   case VirtualMMAIntrinsic::VDMFMA_I32_8x16x128x2_I8:
   case VirtualMMAIntrinsic::VDMFMA_I32_8x16x128x1_I8:
     return {i8, i8, i32};
+  case VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16:
+    return {f16, f16, f32};
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x2_F8E5M2FNUZ:
     return {f8E5M2FNUZ, f8E5M2FNUZ, f32};
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x2_F8E5M2FNUZ_F8E4M3FNUZ:
@@ -1798,6 +1804,8 @@ int64_t VirtualMMAAttr::getSubgroupSize() const {
   case VirtualMMAIntrinsic::VDMFMA_I32_8x16x128x1_I8: {
     return 64;
   }
+  case VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16:
+    return 32;
   }
   assert(false && "unhandled virtual mma layout type.");
   return 0;
@@ -1903,7 +1911,8 @@ int64_t VirtualMMAAttr::getIntrinsicsK() const {
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x2_F8E5M2FNUZ:
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x2_F8E5M2FNUZ_F8E4M3FNUZ:
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x2_F8E4M3FNUZ_F8E5M2FNUZ:
-  case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x2_F8E4M3FNUZ: {
+  case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x2_F8E4M3FNUZ:
+  case VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16: {
     return 2;
   }
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x1_F8E5M2:
@@ -2016,6 +2025,7 @@ bool isVDMFMAIntrinsic(VirtualMMAIntrinsic intrinsic) {
   case VirtualMMAIntrinsic::VMFMA_F32_16x16x32_F16:
   case VirtualMMAIntrinsic::VMFMA_F32_32x32x16_F8E4M3FNUZ:
   case VirtualMMAIntrinsic::VMFMA_F32_32x32x16_F16:
+  case VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16:
     return false;
   }
   assert(false && "unhandled virtual mma intrinsic type");
@@ -2118,6 +2128,40 @@ LogicalResult VirtualMMAAttr::buildUnderlyingOperations(
   }
 
   switch (getIntrinsic()) {
+  case VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16: {
+    // inputs: A vector<16xf16> (2 rows x 8 K), B vector<8xf16>, acc
+    // vector<4xf32> (2 rows x 2 columns). Step s takes K [4s, 4s + 4).
+    auto native =
+        MMAAttr::get(getContext(), MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_F16);
+    SmallVector<VectorType> nativeTypes;
+    native.getDistributedTileTypes(nativeTypes);
+    Type f16 = builder.getF16Type();
+    Value a2d = vector::ShapeCastOp::create(
+        builder, loc, VectorType::get({2, 8}, f16), inputs[0]);
+    Value b2d = vector::ShapeCastOp::create(
+        builder, loc, VectorType::get({1, 8}, f16), inputs[1]);
+    Value acc = vector::ShapeCastOp::create(builder, loc, nativeTypes[2],
+                                            outputs[0]);
+    for (int64_t step = 0; step < 2; ++step) {
+      Value a = vector::ExtractStridedSliceOp::create(
+          builder, loc, a2d, ArrayRef<int64_t>{0, 4 * step},
+          ArrayRef<int64_t>{2, 4}, ArrayRef<int64_t>{1, 1});
+      Value b = vector::ExtractStridedSliceOp::create(
+          builder, loc, b2d, ArrayRef<int64_t>{0, 4 * step},
+          ArrayRef<int64_t>{1, 4}, ArrayRef<int64_t>{1, 1});
+      a = vector::ShapeCastOp::create(builder, loc, nativeTypes[0], a);
+      b = vector::ShapeCastOp::create(builder, loc, nativeTypes[1], b);
+      SmallVector<Value> stepResults;
+      if (failed(native.buildUnderlyingOperations(
+              builder, loc, ValueRange{a, b}, ValueRange{acc}, stepResults))) {
+        return failure();
+      }
+      acc = stepResults[0];
+    }
+    results.push_back(
+        vector::ShapeCastOp::create(builder, loc, outputs[0].getType(), acc));
+    return success();
+  }
   case VirtualMMAIntrinsic::VMFMA_F32_16x16x32_F8E4M3FNUZ:
   case VirtualMMAIntrinsic::VMFMA_F32_16x16x32_F16:
   case VirtualMMAIntrinsic::VMFMA_F32_32x32x16_F8E4M3FNUZ:
@@ -2249,7 +2293,8 @@ int64_t VirtualMMAAttr::getBlockSize() const {
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x128x1_F8E4M3FN:
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x64x1_F16:
   case VirtualMMAIntrinsic::VDMFMA_F32_8x16x64x1_BF16:
-  case VirtualMMAIntrinsic::VDMFMA_I32_8x16x128x1_I8: {
+  case VirtualMMAIntrinsic::VDMFMA_I32_8x16x128x1_I8:
+  case VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16: {
     return 1;
   }
   }
@@ -2267,6 +2312,27 @@ VirtualMMAAttr::getOperandIteratorTypes() const {
 MMASingleSubgroupLayout getSingleSubgroupLayout(VirtualMMAIntrinsic intrinsic,
                                                 int operandIndex) {
   switch (intrinsic) {
+  case VirtualMMAIntrinsic::VNV_MMA_SYNC_F32_16x8x32_F16:
+    // Lane (g = lane / 4, t = lane % 4) holds A rows [2g, 2g + 2) and B
+    // column g, each for K [8t, 8t + 8), and C rows [2g, 2g + 2) x columns
+    // [2t, 2t + 2). Logical rows 2g / 2g + 1 are the hardware rows g / g + 8
+    // of mma.m16n8k16 (A and C agree), and the two native K16 steps take K
+    // [4s, 4s + 4) of each lane's 8 (A and B agree), so the result is the
+    // same matmul up to f32 summation order, with every lane's operands
+    // contiguous in memory (16-byte loads).
+    switch (operandIndex) {
+    case kMMAOperandLhs:
+      return {/*outer=*/{1, 1}, /*thread=*/{8, 4}, /*tstrides=*/{4, 1},
+              /*element=*/{2, 8}};
+    case kMMAOperandRhs:
+      return {/*outer=*/{1, 1}, /*thread=*/{4, 8}, /*tstrides=*/{1, 4},
+              /*element=*/{8, 1}};
+    case kMMAOperandAcc:
+      return {/*outer=*/{1, 1}, /*thread=*/{8, 4}, /*tstrides=*/{4, 1},
+              /*element=*/{2, 2}};
+    default:
+      return {};
+    }
   case VirtualMMAIntrinsic::VMFMA_F32_16x16x32_F16:
     switch (operandIndex) {
     case kMMAOperandLhs:

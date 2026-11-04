@@ -1121,6 +1121,12 @@ getMLPMatmulThroughTrunc(Value v, SmallVectorImpl<Operation *> &chain) {
   return matmul;
 }
 
+// Chains whose (static) row count is below this are not fused: for decode
+// (M = 1) the fusion only saves the [1, F] intermediates, and on GPU the
+// fused M = 1 kernel is slower than the separate matmuls (GX10 decode GPU
+// time 16 -> 161 ms for 22-32 KiB); 2 leaves decode (M = 1) unfused.
+static constexpr int64_t kFuseMLPMinRows = 2;
+
 /// Matches the gated MLP whose down projection is `root`:
 ///
 ///   gate = trunc(x * Wg^T)            up = trunc(x * Wu^T)
@@ -1132,15 +1138,6 @@ getMLPMatmulThroughTrunc(Value v, SmallVectorImpl<Operation *> &chain) {
 /// and `h`) round-trip through memory. Fusing them only pays off together with
 /// RewriteMLPChainAsForall, which produces `h` one ffn-chunk at a time; the
 /// stock tile-and-distribute would keep every op at full size.
-// Chains whose (static) row count is below this are not fused: for decode
-// (M = 1) the fusion only saves the [1, F] intermediates, and on GPU the
-// fused M = 1 kernel is slower than the separate matmuls. 0 fuses all.
-static llvm::cl::opt<int64_t> clFuseMLPMinRows(
-    "iree-dispatch-creation-fuse-mlp-min-rows",
-    llvm::cl::desc("With --iree-dispatch-creation-fuse-mlp, leave gated MLP "
-                   "chains with a static row count below this unfused."),
-    llvm::cl::init(0));
-
 static bool tryFuseMLPChain(Operation *root, FusionGroup &fusionGroup,
                             FusionTracker &tracker) {
   SmallVector<Operation *> downChain;
@@ -1149,8 +1146,9 @@ static bool tryFuseMLPChain(Operation *root, FusionGroup &fusionGroup,
                    down) {
     return false;
   }
-  if (clFuseMLPMinRows > 0) {
-    // Rows: product of all result dims but the last (static only).
+  {
+    // Rows: product of all result dims but the last (static only); chains
+    // with fewer than kFuseMLPMinRows static rows stay unfused.
     auto outType = cast<ShapedType>(down->getResult(0).getType());
     int64_t rows = 1;
     for (int64_t d : outType.getShape().drop_back()) {
@@ -1160,7 +1158,7 @@ static bool tryFuseMLPChain(Operation *root, FusionGroup &fusionGroup,
       }
       rows *= d;
     }
-    if (!ShapedType::isDynamic(rows) && rows < clFuseMLPMinRows) {
+    if (!ShapedType::isDynamic(rows) && rows < kFuseMLPMinRows) {
       return false;
     }
   }
@@ -1315,6 +1313,16 @@ decideFusableLinalgOps(Region &region, DominanceInfo const &dominanceInfo,
           op.removeAttr(kSpecialQKVAttr);
         }
         continue;
+      }
+      // A KV-cache scatter takes the K / V transpose in front of it, so the
+      // transposed K / V is never materialized. Nothing else is fused.
+      if (isQKVFusionEnabled() && !tracker.isFusedOp(&op)) {
+        if (Operation *transpose = getQKVCacheTranspose(&op);
+            transpose && !tracker.isFusedOp(transpose)) {
+          FusionGroup &scatterGroup = tracker.createFusionGroup(context, &op);
+          tracker.appendToFusionGroup(transpose, scatterGroup);
+          continue;
+        }
       }
 #endif // MY_FUSION
       // Start with a root operation and fuse its producers.
@@ -1607,6 +1615,9 @@ struct FormDispatchRegionsPass final
 void FormDispatchRegionsPass::runOnOperation() {
   mlir::FunctionOpInterface funcOp = getOperation();
 #ifdef MY_FUSION
+  if (isAttentionFusionEnabled()) {
+    tagCausalAttentionMasks(funcOp);
+  }
   if (isQKVFusionEnabled()) {
     prepareQKVChains(funcOp);
   }

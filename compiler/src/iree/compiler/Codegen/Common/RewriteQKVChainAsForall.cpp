@@ -55,6 +55,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
@@ -871,12 +872,53 @@ static LogicalResult rewriteQKVChain(RewriterBase &rewriter,
   return success();
 }
 
+/// Set by DispatchCreation on the K / V transpose it puts in front of a
+/// KV-cache scatter (FuseQKVChain.h).
+static constexpr StringLiteral kQKVCacheTransposeAttr =
+    "iree_dispatch.qkv_cache_transpose";
+/// In a KV-cache scatter dispatch with the K / V transpose fused in, the
+/// scatter's default workgroup tile (64 pages x one head x [32, head_dim],
+/// 256 KiB of f16) has no smaller vector level below it, so the transposed
+/// tile would be materialized whole on the stack. Tile the scatter -- and with
+/// it the transpose -- to one page of one head, [1, ..., 1, 32, head_dim]
+/// (4 KiB), at both levels instead.
+static void retileCacheScatters(FunctionOpInterface funcOp) {
+  funcOp.walk([&](IREE::LinalgExt::ScatterOp scatter) {
+    auto transpose = scatter.getUpdates().getDefiningOp<linalg::GenericOp>();
+    if (!transpose || !transpose->hasAttr(kQKVCacheTransposeAttr) ||
+        !getLoweringConfig<IREE::CPU::LoweringConfigAttr>(scatter)) {
+      return;
+    }
+    transpose->removeAttr(kQKVCacheTransposeAttr);
+    ArrayRef<int64_t> shape = scatter.getUpdateType().getShape();
+    if (shape.size() < 2 || ShapedType::isDynamicShape(shape.take_back(2))) {
+      return;
+    }
+    MLIRContext *ctx = scatter.getContext();
+    SmallVector<int64_t> tile(shape.size(), 1);
+    tile[shape.size() - 2] = shape[shape.size() - 2];
+    tile.back() = shape.back();
+    Attribute tileAttr =
+        IREE::CPU::LoweringConfigAttr::getTilingLevelAttr(ctx, tile);
+    SmallVector<NamedAttribute> items;
+    for (IREE::CPU::TilingLevel level :
+         {IREE::CPU::TilingLevel::DistributionTiles,
+          IREE::CPU::TilingLevel::VectorCommonParallelTiles}) {
+      items.emplace_back(IREE::CPU::getTilingLevelName(level), tileAttr);
+    }
+    setLoweringConfig(scatter, IREE::CPU::LoweringConfigAttr::get(ctx, items));
+    LLVM_DEBUG(llvm::dbgs() << "[qkv] retiled cache scatter " << scatter
+                            << "\n");
+  });
+}
+
 struct RewriteQKVChainAsForallPass final
     : impl::RewriteQKVChainAsForallPassBase<RewriteQKVChainAsForallPass> {
   using Base::Base;
 
   void runOnOperation() override {
     FunctionOpInterface funcOp = getOperation();
+    retileCacheScatters(funcOp);
     if (funcOp->hasAttr(kQKVChainRewrittenAttr)) {
       return;
     }
